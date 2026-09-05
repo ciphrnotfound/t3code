@@ -157,9 +157,9 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
 
   return (
     <Alert
-      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3.5 shadow-[0_18px_46px_-32px_rgb(0_0_0/62%)] [&_[data-slot=alert-body]]:flex-wrap [&_[data-slot=alert-body]]:gap-x-3.5 [&_[data-slot=alert-body]]:gap-y-2.5 @sm/provenance:[&_[data-slot=alert-body]]:flex-nowrap [&_[data-slot=alert-icon]]:size-8 [&_[data-slot=alert-icon]]:rounded-lg [&_[data-slot=alert-icon]]:border-0 [&_[data-slot=alert-icon]]:bg-transparent [&_[data-slot=alert-icon]]:shadow-none [&_[data-slot=alert-icon]>svg]:size-4 [&_[data-slot=alert-content]]:gap-1"
+      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3 shadow-[0_16px_42px_-30px_rgb(0_0_0/60%)] [&_[data-slot=alert-icon]]:size-7 [&_[data-slot=alert-icon]>svg]:size-3.5"
       controlAlignment="first-line"
-      actionPlacement="side"
+      actionPlacement="bottom"
       data-alert-queue-item="true"
       data-provenance-overlap="true"
       iconStyle="badge"
@@ -167,14 +167,14 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
       variant="warning"
     >
       <AlertTriangleIcon aria-hidden="true" />
-      <AlertTitle className="pe-1 text-sm font-semibold tracking-[-0.01em]">
+      <AlertTitle className="pe-1 text-[13px] font-medium tracking-[-0.01em]">
         {isExternal
           ? "Unattributed workspace change"
           : isWorktreeMismatch
             ? "Provider directory mismatch"
             : "Overlapping changes detected"}
       </AlertTitle>
-      <AlertDescription className="gap-1.5 text-xs leading-relaxed">
+      <AlertDescription className="gap-1.5 text-[11px] leading-relaxed text-muted-foreground/85">
         <div>
           {isExternal ? (
             <>
@@ -211,17 +211,17 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
           )}
         </div>
         {!isWorktreeMismatch ? (
-          <div className="inline-flex self-start text-[10px] font-medium text-warning-foreground/75">
+          <div className="inline-flex self-start text-[10px] text-warning-foreground/75">
             {lineScope ? lineScope : "Entire file"}
           </div>
         ) : null}
         {isOverlap ? (
           <div className="mt-0.5 flex items-center gap-1.5 truncate text-[10px] text-muted-foreground @sm/provenance:hidden">
-            <strong className="truncate text-foreground/85">{earlierProvider}</strong>
+            <span className="truncate text-foreground/85">{earlierProvider}</span>
             <ArrowRightIcon className="size-3 shrink-0 opacity-60" aria-hidden="true" />
-            <strong className="truncate text-foreground/85">
+            <span className="truncate text-foreground/85">
               {sameProvider ? "This turn" : currentProvider}
-            </strong>
+            </span>
           </div>
         ) : null}
         {isOverlap ? (
@@ -230,11 +230,11 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
             aria-label="Competing thread changes"
           >
             <div className="min-w-0 flex-1">
-              <div className="text-[9px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+              <div className="text-[9px] uppercase tracking-[0.08em] text-muted-foreground">
                 Earlier
               </div>
               <div className="truncate text-foreground/90">
-                <strong>{earlierProvider}</strong> · {earlierAction ?? earlierOperation}
+                {earlierProvider} · {earlierAction ?? earlierOperation}
               </div>
             </div>
             <ArrowRightIcon
@@ -242,21 +242,21 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
               aria-hidden="true"
             />
             <div className="min-w-0 flex-1">
-              <div className="text-[9px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+              <div className="text-[9px] uppercase tracking-[0.08em] text-muted-foreground">
                 Current
               </div>
               <div className="truncate text-foreground/90">
-                <strong>{sameProvider ? "This thread" : currentProvider}</strong> ·{" "}
+                {sameProvider ? "This thread" : currentProvider} ·{" "}
                 {currentAction ?? currentOperation}
               </div>
             </div>
           </div>
         ) : null}{" "}
       </AlertDescription>
-      <AlertAction className="ms-11 w-[calc(100%-2.75rem)] shrink-0 items-center justify-end gap-1.5 border-t border-border/35 pt-2.5 @sm/provenance:ms-1 @sm/provenance:w-auto @sm/provenance:self-stretch @sm/provenance:border-t-0 @sm/provenance:border-l @sm/provenance:ps-3.5 @sm/provenance:pt-0">
+      <AlertAction className="w-full items-center justify-between gap-x-3 gap-y-1.5">
         {conflictReview ? (
           <Button
-            className="rounded-full px-3.5"
+            className="px-3"
             size="xs"
             variant="secondary"
             onClick={() => onCompare(conflictReview)}
@@ -265,20 +265,15 @@ export const ProvenanceOverlapBanner = memo(function ProvenanceOverlapBanner({
             <span className="hidden @sm/provenance:inline">Compare changes</span>
           </Button>
         ) : null}
-        <Button className="rounded-full px-3" size="xs" variant="ghost" onClick={onDisableAlerts}>
-          Don't show again
-        </Button>
-        <Button
-          aria-label="Dismiss workspace overlap warning"
-          onClick={() => {
+        <span className="flex items-center gap-1">
+          <Button size="xs" variant="ghost" onClick={onDisableAlerts}>Don't show again</Button>
+          <Button aria-label="Dismiss workspace overlap warning" onClick={() => {
             setDismissedKey(dismissalKey);
             if (typeof window !== "undefined") window.localStorage.setItem(dismissalKey, "1");
-          }}
-          size="icon-xs"
-          variant="ghost"
-        >
-          <XIcon aria-hidden="true" />
-        </Button>
+          }} size="icon-xs" variant="ghost">
+            <XIcon aria-hidden="true" />
+          </Button>
+        </span>
       </AlertAction>
     </Alert>
   );

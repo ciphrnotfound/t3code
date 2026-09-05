@@ -70,7 +70,7 @@ export const SafeUndoFailureAlert = memo(function SafeUndoFailureAlert({
   return (
     <Alert
       actionPlacement="bottom"
-      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3.5 shadow-[0_18px_46px_-32px_rgb(0_0_0/62%)] [&_[data-slot=alert-body]]:gap-3.5 [&_[data-slot=alert-icon]]:size-8 [&_[data-slot=alert-icon]]:rounded-lg [&_[data-slot=alert-icon]]:border-0 [&_[data-slot=alert-icon]]:bg-transparent [&_[data-slot=alert-icon]]:shadow-none [&_[data-slot=alert-icon]>svg]:size-4 [&_[data-slot=alert-content]]:gap-1 [&_[data-slot=alert-action-row]]:mt-3 [&_[data-slot=alert-action-row]]:border-border/40 [&_[data-slot=alert-action-row]]:pt-2.5"
+      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3 shadow-[0_16px_42px_-30px_rgb(0_0_0/60%)] [&_[data-slot=alert-icon]]:size-7 [&_[data-slot=alert-icon]>svg]:size-3.5"
       controlAlignment="first-line"
       data-alert-queue-item="true"
       data-provenance-safe-undo-failure="true"
@@ -79,37 +79,22 @@ export const SafeUndoFailureAlert = memo(function SafeUndoFailureAlert({
       variant="warning"
     >
       <CircleAlertIcon aria-hidden="true" />
-      <AlertTitle className="pe-1 text-sm font-semibold tracking-[-0.01em]">
+      <AlertTitle className="pe-1 text-[13px] font-medium tracking-[-0.01em]">
         Safe undo needs review
       </AlertTitle>
-      <AlertDescription className="gap-1.5 text-[11px] leading-relaxed">
+      <AlertDescription className="gap-1.5 text-[11px] leading-relaxed text-muted-foreground/85">
         <p>
           {turnLabel} was not changed. T3 stopped before applying a partial or ambiguous revert.
         </p>
-        <p className="rounded-md bg-foreground/[0.035] px-2 py-1.5 text-foreground/75">{detail}</p>
+        <p className="rounded-lg border border-foreground/[0.045] bg-foreground/[0.025] px-2.5 py-2 text-foreground/70">{detail}</p>
       </AlertDescription>
-      <AlertAction className="w-full flex-wrap justify-start gap-1 @sm/provenance:justify-end">
-        <Button size="xs" variant="ghost" onClick={onOpenHistory}>
-          <HistoryIcon aria-hidden="true" />
-          Open provenance
-        </Button>
-        {turnId ? (
-          <Button size="xs" variant="secondary" onClick={() => onInspect(turnId)}>
-            <FileSearchIcon aria-hidden="true" />
-            Review diff
-          </Button>
-        ) : null}
-        <Button size="xs" variant="ghost" onClick={onDisableAlerts}>
-          Don't show again
-        </Button>
-        <Button
-          aria-label="Dismiss safe undo review alert"
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => setDismissedFailureId(failure.id)}
-        >
-          <XIcon aria-hidden="true" />
-        </Button>
+      <AlertAction className="w-full items-center justify-between gap-x-3 gap-y-1.5">
+        <Button size="xs" variant="ghost" onClick={onOpenHistory}><HistoryIcon aria-hidden="true" />History</Button>
+        <span className="flex items-center gap-1">
+          {turnId ? <Button size="xs" variant="secondary" onClick={() => onInspect(turnId)}><FileSearchIcon aria-hidden="true" />Review diff</Button> : null}
+          <Button size="xs" variant="ghost" onClick={onDisableAlerts}>Don't show again</Button>
+          <Button aria-label="Dismiss safe undo review alert" size="icon-xs" variant="ghost" onClick={() => setDismissedFailureId(failure.id)}><XIcon aria-hidden="true" /></Button>
+        </span>
       </AlertAction>
     </Alert>
   );

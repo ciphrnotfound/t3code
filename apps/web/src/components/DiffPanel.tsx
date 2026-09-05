@@ -45,6 +45,7 @@ import { useTheme } from "../hooks/useTheme";
 import {
   buildFileDiffContentVersion,
   buildFileDiffIdentityKey,
+  buildFileDiffRenderKey,
   getDiffCollapseIconClassName,
   getDiffLineStat,
   getRenderablePatch,
@@ -151,6 +152,7 @@ function ConflictDiffColumn({
       fileDiff,
       filePath: resolveFileDiffPath(fileDiff),
       fileKey: `${side}:${buildFileDiffRenderKey(fileDiff)}`,
+      fileVersion: buildFileDiffContentVersion(fileDiff),
       collapsed: false,
     }));
   }, [filePath, renderable, side]);
@@ -240,6 +242,7 @@ function ConflictDiffColumn({
           sectionId={sectionId}
           sectionTitle={`${side} · ${turn.providerName} · turn ${turn.checkpointTurnCount ?? "?"}`}
           composerDraftTarget={composerDraftTarget}
+          renderHeaderFilenameSuffix={() => null}
           renderHeaderPrefix={() => null}
           options={{
             diffStyle: diffRenderMode === "split" ? "split" : "unified",
@@ -286,6 +289,7 @@ export default function DiffPanel({
   const settings = useClientSettings();
   const [initialGitScope] = useState(initialGitScopeProp);
   const diffLayout = settings.diffLayout;
+  const diffRenderMode = diffLayout === "split" ? "split" : "stacked";
   const updateClientSettings = useUpdateClientSettings();
   const [wordWrap, setWordWrap] = useState(settings.wordWrap);
   const [diffIgnoreWhitespace, setDiffIgnoreWhitespace] = useState(settings.diffIgnoreWhitespace);

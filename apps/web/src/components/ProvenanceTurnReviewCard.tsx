@@ -5,6 +5,7 @@ import {
   LoaderCircleIcon,
   ShieldAlertIcon,
   ShieldCheckIcon,
+  Undo2Icon,
   XIcon,
 } from "lucide-react";
 import {
@@ -70,7 +71,7 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
 
   return (
     <Alert
-      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3.5 shadow-[0_18px_46px_-32px_rgb(0_0_0/62%)] [&_[data-slot=alert-body]]:gap-3.5 [&_[data-slot=alert-icon]]:size-8 [&_[data-slot=alert-icon]]:rounded-lg [&_[data-slot=alert-icon]]:border-0 [&_[data-slot=alert-icon]]:bg-transparent [&_[data-slot=alert-icon]]:shadow-none [&_[data-slot=alert-icon]>svg]:size-4 [&_[data-slot=alert-content]]:gap-1 [&_[data-slot=alert-action-row]]:mt-3 [&_[data-slot=alert-action-row]]:border-border/40 [&_[data-slot=alert-action-row]]:pt-2.5"
+      className="alert-glass @container/provenance pointer-events-auto mx-auto min-w-0 w-full max-w-3xl rounded-2xl border-border/45 px-4 py-3 shadow-[0_16px_42px_-30px_rgb(0_0_0/60%)] [&_[data-slot=alert-icon]]:size-7 [&_[data-slot=alert-icon]>svg]:size-3.5"
       controlAlignment="first-line"
       actionPlacement="bottom"
       data-alert-queue-item="true"
@@ -79,14 +80,14 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
       role="status"
       variant={lineageComplete ? "info" : "warning"}
     >
-      <HistoryIcon aria-hidden="true" />
-      <AlertTitle className="pe-1 text-sm font-semibold tracking-[-0.01em]">
+      <Undo2Icon aria-hidden="true" />
+      <AlertTitle className="pe-1 text-[13px] font-medium tracking-[-0.01em]">
         Changes from {target.providerName}
         {turnLabel}
       </AlertTitle>
-      <AlertDescription className="gap-2 text-[11px] leading-relaxed">
-        <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-muted-foreground">
-          <span className="font-medium text-foreground/90">
+      <AlertDescription className="gap-1.5 text-[11px] leading-relaxed">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-muted-foreground/85">
+          <span className="text-foreground/85">
             {fileCount} {fileCount === 1 ? "file" : "files"}
           </span>
           <span aria-hidden="true" className="text-border">
@@ -103,7 +104,7 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
           ) : null}
         </div>
         {target.turnSummary ? (
-          <p className="line-clamp-2 max-w-[32rem] text-[11px] leading-[1.55] text-foreground/75">
+          <p className="line-clamp-2 max-w-[34rem] text-[11px] leading-[1.55] text-foreground/70">
             {target.turnSummary}
           </p>
         ) : null}
@@ -121,7 +122,7 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
             ) : (
               <ShieldAlertIcon className="size-3 shrink-0 text-warning" aria-hidden="true" />
             )}
-            <span className="font-medium text-foreground/80">Scope</span>
+            <span className="text-foreground/75">Scope</span>
             <span className="min-w-0 truncate text-muted-foreground">
               {unrequestedFileCount === 0
                 ? `All ${fileCount} changed ${fileCount === 1 ? "file was" : "files were"} named in the request`
@@ -135,39 +136,41 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
               className="size-3.5 shrink-0 animate-spin text-info"
               aria-hidden="true"
             />
-            <span className="font-medium">Checking the workspace and later changes…</span>
+            <span>Checking the workspace and later changes…</span>
           </div>
         ) : hasRecoveryPreview ? (
-          <div className="flex min-w-0 items-start gap-2 rounded-lg border border-success/20 bg-success/8 px-2.5 py-2 text-[11px] text-foreground/85">
-            <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0 text-success" aria-hidden="true" />
+          <div className="flex min-w-0 items-center gap-2 rounded-xl border border-success/18 bg-success/[0.055] px-2.5 py-2 text-[11px] text-foreground/80">
+            <ShieldCheckIcon className="size-3.5 shrink-0 text-success" aria-hidden="true" />
             <span className="min-w-0">
-              <strong className="block font-medium text-success">Recovery check passed</strong>
-              <span className="block text-[10px] text-muted-foreground">
-                This turn can be removed without changing the workspace preview or losing compatible
-                later work.
+              <span className="text-success">Recovery check passed</span>
+              <span className="ms-1.5 text-[10px] text-muted-foreground">
+                Safe to remove without disturbing compatible later work.
               </span>
             </span>
           </div>
         ) : null}
         {expanded ? (
           <div
-            className="mt-1 max-h-[min(24vh,8rem)] space-y-3 overflow-y-auto pe-1 [scrollbar-width:thin]"
+            className="mt-1 max-h-[min(38vh,18rem)] space-y-3 overflow-y-auto pe-1 [scrollbar-width:thin]"
             aria-label="Safe undo preview"
           >
-            <div className="flex flex-wrap gap-1.5" aria-label="Safe undo preview summary">
-              <span className="inline-flex items-center gap-1 rounded-full bg-success/8 px-2 py-1 font-medium text-success">
-                Remove <strong>{preview.removable.length}</strong>
-              </span>
-              <span className="inline-flex items-center gap-1 rounded-full bg-info/8 px-2 py-1 font-medium text-info">
-                Preserve <strong>{preview.preserved.length}</strong>
-              </span>
-              <span className="inline-flex items-center gap-1 rounded-full bg-warning/8 px-2 py-1 font-medium text-warning">
-                Review <strong>{preview.conflicts.length}</strong>
-              </span>
+            <div className="grid grid-cols-3 divide-x divide-border/45 overflow-hidden rounded-xl border border-border/45 bg-foreground/[0.025]" aria-label="Safe undo preview summary">
+              <div className="px-2.5 py-2">
+                <div className="text-[10px] uppercase tracking-[0.07em] text-foreground/55">Remove</div>
+                <div className="mt-0.5 text-sm tabular-nums text-success">{preview.removable.length}</div>
+              </div>
+              <div className="px-2.5 py-2">
+                <div className="text-[10px] uppercase tracking-[0.07em] text-foreground/55">Keep</div>
+                <div className="mt-0.5 text-sm tabular-nums text-info">{preview.preserved.length}</div>
+              </div>
+              <div className="px-2.5 py-2">
+                <div className="text-[10px] uppercase tracking-[0.07em] text-foreground/55">Review</div>
+                <div className="mt-0.5 text-sm tabular-nums text-warning">{preview.conflicts.length}</div>
+              </div>
             </div>
             <div className="space-y-1.5" aria-label="Thread change timeline">
-              <div className="text-[11px] font-medium text-foreground/80">Recent turns</div>
-              <div className="divide-y divide-border/40 rounded-lg bg-foreground/[0.035] px-2">
+              <div className="text-[9px] uppercase tracking-[0.08em] text-muted-foreground/80">Recent turns</div>
+              <div className="divide-y divide-border/40 overflow-hidden rounded-xl border border-border/40 bg-foreground/[0.02]">
                 {timeline.map((changeSet) => {
                   const path = changeSet.mutations[0]?.path;
                   const turnPreview = buildSafeUndoPreview(
@@ -186,29 +189,24 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
                     path;
                   return (
                     <div
-                      className="flex min-h-8 items-center gap-1 py-1"
+                      className="flex min-h-9 items-center gap-2 px-2.5 py-1"
                       key={`${changeSet.threadId}-${changeSet.turnId}`}
                     >
                       <button
                         aria-label={`Review ${changeSet.providerName} turn ${changeSet.checkpointTurnCount ?? ""} changes${path ? ` in ${path}` : ""}`}
-                        className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
                         onClick={() => path && onInspect(changeSet.turnId, path)}
                         disabled={!path}
                         type="button"
                       >
-                        <span className="truncate font-medium text-foreground/90">
-                          {changeSet.providerName}
+                        <span className="inline-flex shrink-0 rounded-md bg-foreground/[0.055] px-1.5 py-0.5 text-[9px] text-foreground/75">
+                          Turn {changeSet.checkpointTurnCount ?? "?"}
                         </span>
-                        <span className="min-w-0 truncate text-muted-foreground">
-                          {changeSet.mutations[0]?.action ?? "Changed files"} ·{" "}
-                          {changeSet.mutations.length} file
+                        <span className="min-w-0 truncate text-muted-foreground/85">
+                          {changeSet.providerName} · {changeSet.mutations[0]?.action ?? "Changed files"} · {changeSet.mutations.length} file
                           {changeSet.mutations.length === 1 ? "" : "s"}
                         </span>
-                        <span className="ms-auto shrink-0 font-mono text-[9px] text-muted-foreground/70">
-                          {changeSet.status === "reverted"
-                            ? "undone"
-                            : changeSet.turnId.slice(0, 8)}
-                        </span>
+                        {changeSet.status === "reverted" ? <span className="ms-auto shrink-0 text-[9px] text-muted-foreground/70">undone</span> : null}
                       </button>
                       {canUndoTurn ? (
                         <Button
@@ -234,30 +232,30 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
                 })}
               </div>
             </div>
-            <div className="text-[11px] font-medium text-foreground/80">Turn ownership</div>
-            <div className="divide-y divide-border/40 rounded-lg bg-foreground/[0.035]">
+            <div className="text-[9px] uppercase tracking-[0.08em] text-muted-foreground/80">Turn ownership</div>
+            <div className="divide-y divide-border/40 overflow-hidden rounded-xl border border-border/40 bg-foreground/[0.02]">
               {preview.impacts.map((impact) => (
                 <button
-                  className="flex min-h-9 w-full items-center justify-between gap-3 px-2.5 py-1.5 text-left hover:bg-muted/30"
+                  className="flex min-h-10 w-full items-center justify-between gap-3 px-2.5 py-1.5 text-left transition-colors hover:bg-muted/25"
                   key={`${impact.path}-${impact.target.turnId}`}
                   onClick={() => onInspect(target.turnId, impact.path)}
                   type="button"
                 >
                   <span className="min-w-0">
-                    <span className="block truncate font-mono text-foreground/90">
+                    <span className="block truncate font-mono text-[10px] text-foreground/85">
                       {impact.path}
                     </span>
-                    <span className="block truncate text-[10px] text-muted-foreground">
+                    <span className="block truncate text-[9px] text-muted-foreground">
                       {impact.target.providerName} · turn {impact.target.checkpointTurnCount ?? "?"}
                     </span>
                   </span>
                   <span
                     className={
                       impact.kind === "remove"
-                        ? "shrink-0 text-success"
+                        ? "shrink-0 rounded-md bg-success/[0.08] px-1.5 py-0.5 text-[9px] text-success"
                         : impact.kind === "preserve"
-                          ? "shrink-0 text-info"
-                          : "shrink-0 text-warning"
+                          ? "shrink-0 rounded-md bg-info/[0.08] px-1.5 py-0.5 text-[9px] text-info"
+                          : "shrink-0 rounded-md bg-warning/[0.08] px-1.5 py-0.5 text-[9px] text-warning"
                     }
                   >
                     {impact.kind === "remove"
@@ -276,7 +274,7 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
                 Preserved later work: {preview.preserved.map((item) => item.path).join(", ")}
               </div>
             ) : null}
-            <div className="text-[10px] leading-relaxed text-muted-foreground">
+            <div className="text-[10px] leading-relaxed text-muted-foreground/75">
               {preview.canApply
                 ? "Undo removes this turn's workspace patch while preserving conversation history and later non-overlapping work."
                 : "Undo is paused until the overlapping changes are reviewed."}
@@ -284,37 +282,40 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
           </div>
         ) : null}
       </AlertDescription>
-      <AlertAction className="w-full flex-wrap justify-start gap-1 @sm/provenance:justify-end">
-        {onOpenHistory ? (
-          <Button size="xs" variant="ghost" onClick={onOpenHistory}>
-            <HistoryIcon aria-hidden="true" />
-            History
+      <AlertAction className="w-full items-center justify-between gap-x-3 gap-y-1.5">
+        <span className="flex min-w-0 flex-wrap items-center gap-1">
+          {onOpenHistory ? (
+            <Button size="xs" variant="ghost" onClick={onOpenHistory}>
+              <HistoryIcon aria-hidden="true" />
+              History
+            </Button>
+          ) : null}
+          {firstPath ? (
+            <Button size="xs" variant="ghost" onClick={() => onInspect(target.turnId, firstPath)}>
+              Review diff
+            </Button>
+          ) : null}
+          <Button disabled={!lineageComplete} size="xs" variant="ghost" onClick={() => setExpanded((value) => !value)}>
+            {expanded ? "Hide details" : "Details"}
           </Button>
-        ) : null}
-        <Button
-          disabled={!lineageComplete}
-          size="xs"
-          variant="ghost"
-          onClick={() => setExpanded((value) => !value)}
-        >
-          {expanded ? "Hide preview" : "Preview undo"}
-        </Button>
-        {onPreviewUndo && canApplySafeUndo && !hasRecoveryPreview ? (
-          <Button
-            disabled={isPreviewingRecovery}
-            size="xs"
-            variant="secondary"
-            onClick={async () => {
-              setExpanded(true);
-              setPreviewingTurnId(target.turnId);
-              try {
-                const succeeded = await onPreviewUndo(target.checkpointTurnCount!);
-                if (succeeded !== false) setPreviewedTurnId(target.turnId);
-              } finally {
-                setPreviewingTurnId(null);
-              }
-            }}
-          >
+        </span>
+        <span className="flex flex-wrap items-center gap-1">
+          {onPreviewUndo && canApplySafeUndo && !hasRecoveryPreview ? (
+            <Button
+              disabled={isPreviewingRecovery}
+              size="xs"
+              variant="secondary"
+              onClick={async () => {
+                setExpanded(true);
+                setPreviewingTurnId(target.turnId);
+                try {
+                  const succeeded = await onPreviewUndo(target.checkpointTurnCount!);
+                  if (succeeded !== false) setPreviewedTurnId(target.turnId);
+                } finally {
+                  setPreviewingTurnId(null);
+                }
+              }}
+            >
             {isPreviewingRecovery ? (
               <>
                 <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
@@ -323,11 +324,6 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
             ) : (
               "Preview recovery"
             )}
-          </Button>
-        ) : null}
-        {firstPath ? (
-          <Button size="xs" variant="ghost" onClick={() => onInspect(target.turnId, firstPath)}>
-            Review changes
           </Button>
         ) : null}
         {onUndoTurn && canApplySafeUndo ? (
@@ -354,6 +350,7 @@ export const ProvenanceTurnReviewCard = memo(function ProvenanceTurnReviewCard({
         >
           <XIcon aria-hidden="true" />
         </Button>
+        </span>
       </AlertAction>
     </Alert>
   );
