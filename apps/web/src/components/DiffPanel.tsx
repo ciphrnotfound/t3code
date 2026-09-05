@@ -6,7 +6,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
-import type { ScopedThreadRef, TurnId } from "@t3tools/contracts";
+import type { MessageId, ScopedThreadRef, TurnId } from "@t3tools/contracts";
 import {
   ArrowRightIcon,
   CheckIcon,
@@ -16,10 +16,14 @@ import {
   ChevronsUpDownIcon,
   Columns2Icon,
   FolderTreeIcon,
+  DownloadIcon,
+  FileCode2Icon,
+  MessageSquareTextIcon,
   PilcrowIcon,
   RefreshCwIcon,
   Rows3Icon,
   SearchIcon,
+  ShieldCheckIcon,
   TextWrapIcon,
 } from "lucide-react";
 import * as Schema from "effect/Schema";
@@ -29,9 +33,14 @@ import { useOpenInPreferredEditor } from "../editorPreferences";
 import { type DraftId } from "../composerDraftStore";
 import { openDiffFilePrimaryAction } from "../diffFileActions";
 import { useCheckpointDiff } from "~/lib/checkpointDiffState";
+import { readProvenanceTurnChangeSets } from "@t3tools/client-runtime/state/provenance";
 import { cn } from "~/lib/utils";
-import { selectThreadDiffPanelSelection, useDiffPanelStore } from "../diffPanelStore";
 import { useLocalStorage } from "../hooks/useLocalStorage";
+import {
+  selectThreadDiffPanelSelection,
+  useDiffPanelStore,
+  type ConflictReviewTurn,
+} from "../diffPanelStore";
 import { useTheme } from "../hooks/useTheme";
 import {
   buildFileDiffContentVersion,
@@ -82,9 +91,14 @@ import { useEnvironmentQuery } from "../state/query";
 import { useAtomCommand } from "../state/use-atom-command";
 import { serverEnvironment } from "../state/server";
 import { reviewEnvironment } from "../state/review";
+import {
+  buildProvenancePatchFilename,
+  downloadProvenancePatch,
+} from "../lib/provenancePatchExport";
 import { vcsEnvironment } from "../state/vcs";
 import { buildBaseRefChoices, filterBaseRefChoices } from "../lib/baseRefChoices";
 import { createGitDiffFileContentsLoader } from "../lib/diffFileContents";
+import { describeConflictIntegrationOrder, formatConflictReviewScope } from "../lib/conflictReview";
 
 type DiffThemeType = "light" | "dark";
 const AUTOMATIC_BASE_REF = "__automatic_base_ref__";
@@ -95,6 +109,160 @@ interface CollapsedDiffFilesState {
   readonly fileKeys: ReadonlySet<string>;
 }
 
+function ConflictDiffColumn({
+  side,
+  turn,
+  filePath,
+  lineRanges,
+  patch,
+  error,
+  isLoading,
+  composerDraftTarget,
+  resolvedTheme,
+  diffRenderMode,
+  wordWrap,
+  conversationMessageId,
+  onRevealConversationMessage,
+}: {
+  readonly side: "Earlier" | "Current";
+  readonly turn: ConflictReviewTurn;
+  readonly filePath: string;
+  readonly lineRanges: ReadonlyArray<{ readonly start: number; readonly end: number }>;
+  readonly patch: string | undefined;
+  readonly error: string | null | undefined;
+  readonly isLoading: boolean;
+  readonly composerDraftTarget: ScopedThreadRef | DraftId;
+  readonly resolvedTheme: DiffThemeType;
+  readonly diffRenderMode: "stacked" | "split";
+  readonly wordWrap: boolean;
+  readonly conversationMessageId?: MessageId;
+  readonly onRevealConversationMessage?: (messageId: MessageId) => void;
+}) {
+  const renderable = useMemo(
+    () => getRenderablePatch(patch, `conflict-review:${side}:${resolvedTheme}`),
+    [patch, resolvedTheme, side],
+  );
+  const files = useMemo(() => {
+    if (!renderable || renderable.kind !== "files") return [];
+    const matching = renderable.files.filter(
+      (fileDiff) => resolveFileDiffPath(fileDiff) === filePath,
+    );
+    return (matching.length > 0 ? matching : renderable.files).map((fileDiff) => ({
+      fileDiff,
+      filePath: resolveFileDiffPath(fileDiff),
+      fileKey: `${side}:${buildFileDiffRenderKey(fileDiff)}`,
+      collapsed: false,
+    }));
+  }, [filePath, renderable, side]);
+  const sectionId = `conflict:${side.toLowerCase()}:${turn.threadId}:${turn.turnId}`;
+
+  return (
+    <section
+      className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/60 bg-background/65"
+      data-conflict-review-side={side.toLowerCase()}
+    >
+      <header className="flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
+        <span className="rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+          {side}
+        </span>
+        <span className="min-w-0 truncate text-xs font-medium text-foreground/90">
+          {turn.providerName}
+        </span>
+        <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+          · turn {turn.checkpointTurnCount ?? "?"} · {turn.action}
+        </span>
+        <span className="ml-auto flex shrink-0 items-center gap-0.5">
+          {conversationMessageId && onRevealConversationMessage ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    aria-label={`Open ${side.toLowerCase()} turn conversation`}
+                    onClick={() => onRevealConversationMessage(conversationMessageId)}
+                    size="icon-xs"
+                    variant="ghost"
+                  />
+                }
+              >
+                <MessageSquareTextIcon aria-hidden="true" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">Open producing conversation</TooltipPopup>
+            </Tooltip>
+          ) : null}
+          {patch ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    aria-label={`Export ${side.toLowerCase()} turn patch`}
+                    onClick={() =>
+                      downloadProvenancePatch(
+                        buildProvenancePatchFilename({
+                          turnId: turn.turnId,
+                          providerName: turn.providerName,
+                          ...(turn.checkpointTurnCount !== null
+                            ? { turnCount: turn.checkpointTurnCount }
+                            : {}),
+                        }),
+                        patch,
+                      )
+                    }
+                    size="icon-xs"
+                    variant="ghost"
+                  />
+                }
+              >
+                <DownloadIcon aria-hidden="true" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">Export this turn patch</TooltipPopup>
+            </Tooltip>
+          ) : null}
+        </span>
+      </header>
+      {isLoading ? (
+        <DiffPanelLoadingState label={`Loading ${side.toLowerCase()} turn...`} />
+      ) : error ? (
+        <div className="flex flex-1 items-center justify-center p-4 text-center text-[11px] text-error/80">
+          {error}
+        </div>
+      ) : renderable?.kind === "files" && files.length > 0 ? (
+        <AnnotatableCodeView
+          codeViewKey={sectionId}
+          className="h-full min-h-0 overflow-auto"
+          files={files}
+          ownership={[
+            {
+              filePath,
+              lineRanges,
+              label: `${turn.providerName} · turn ${turn.checkpointTurnCount ?? "?"} · ${turn.action}`,
+            },
+          ]}
+          sectionId={sectionId}
+          sectionTitle={`${side} · ${turn.providerName} · turn ${turn.checkpointTurnCount ?? "?"}`}
+          composerDraftTarget={composerDraftTarget}
+          renderHeaderPrefix={() => null}
+          options={{
+            diffStyle: diffRenderMode === "split" ? "split" : "unified",
+            lineDiffType: "none",
+            overflow: wordWrap ? "wrap" : "scroll",
+            theme: resolveDiffThemeName(resolvedTheme),
+            themeType: resolvedTheme,
+            stickyHeaders: true,
+          }}
+        />
+      ) : renderable?.kind === "raw" ? (
+        <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap p-3 font-mono text-[10px] leading-relaxed text-muted-foreground">
+          {renderable.text}
+        </pre>
+      ) : (
+        <div className="flex flex-1 items-center justify-center p-4 text-center text-[11px] text-muted-foreground">
+          No checkpoint patch is available for this turn.
+        </div>
+      )}
+    </section>
+  );
+}
+
 const EMPTY_COLLAPSED_DIFF_FILE_KEYS: ReadonlySet<string> = new Set();
 
 interface DiffPanelProps {
@@ -102,6 +270,7 @@ interface DiffPanelProps {
   composerDraftTarget: ScopedThreadRef | DraftId;
   initialGitScope: "branch" | "unstaged";
   workspaceMutationId: string | null;
+  onRevealConversationMessage?: (messageId: MessageId) => void;
 }
 
 export { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
@@ -111,6 +280,7 @@ export default function DiffPanel({
   composerDraftTarget,
   initialGitScope: initialGitScopeProp,
   workspaceMutationId,
+  onRevealConversationMessage,
 }: DiffPanelProps) {
   const { resolvedTheme } = useTheme();
   const settings = useClientSettings();
@@ -175,6 +345,34 @@ export default function DiffPanel({
     ),
   );
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
+  const conflictSelection = diffSelection.kind === "conflict" ? diffSelection : null;
+  const earlierConflictThread = useThread(
+    conflictSelection && activeThread
+      ? {
+          environmentId: activeThread.environmentId,
+          threadId: conflictSelection.earlier.threadId,
+        }
+      : null,
+  );
+  const earlierConflictChangeSet = useMemo(
+    () =>
+      conflictSelection && earlierConflictThread
+        ? readProvenanceTurnChangeSets(earlierConflictThread.activities).find(
+            (changeSet) => changeSet.turnId === conflictSelection.earlier.turnId,
+          )
+        : undefined,
+    [conflictSelection, earlierConflictThread],
+  );
+  const earlierConflictTurnCount =
+    conflictSelection?.earlier.checkpointTurnCount ??
+    earlierConflictChangeSet?.checkpointTurnCount ??
+    null;
+  const { turnDiffSummaries: earlierConflictTurnDiffSummaries } =
+    useTurnDiffSummaries(earlierConflictThread);
+  const earlierConflictAssistantMessageId =
+    earlierConflictTurnDiffSummaries.find(
+      (summary) => summary.turnId === conflictSelection?.earlier.turnId,
+    )?.assistantMessageId ?? null;
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
   const orderedTurnDiffSummaries = useMemo(
@@ -200,23 +398,77 @@ export default function DiffPanel({
     );
   }, [diffSelection, orderedTurnDiffSummaries, routeThreadRef]);
 
-  const selectedTurnId = diffSelection.kind === "turn" ? diffSelection.turnId : null;
+  const selectedTurnId =
+    diffSelection.kind === "turn"
+      ? diffSelection.turnId
+      : (conflictSelection?.current.turnId ?? null);
   const selectedGitScope = diffSelection.kind === "unstaged" ? "unstaged" : "branch";
   const selectedBaseRef = diffSelection.kind === "branch" ? diffSelection.baseRef : null;
-  const selectedFilePath = diffSelection.kind === "turn" ? diffSelection.filePath : null;
+  const selectedFilePath =
+    diffSelection.kind === "turn" ? diffSelection.filePath : (conflictSelection?.filePath ?? null);
   const selectedFileRevealRequestId =
     diffSelection.kind === "turn" ? diffSelection.revealRequestId : 0;
   const selectedTurn =
     selectedTurnId === null
       ? undefined
       : (orderedTurnDiffSummaries.find((summary) => summary.turnId === selectedTurnId) ??
-        orderedTurnDiffSummaries[0]);
-  const selectedCheckpointTurnCount =
-    selectedTurn &&
-    (selectedTurn.checkpointTurnCount ?? inferredCheckpointTurnCountByTurnId[selectedTurn.turnId]);
+        (conflictSelection ? undefined : orderedTurnDiffSummaries[0]));
+  const selectedAssistantMessageId = selectedTurn?.assistantMessageId ?? null;
+  const conflictRecommendation = conflictSelection
+    ? describeConflictIntegrationOrder({
+        earlier: {
+          providerName: conflictSelection.earlier.providerName,
+          ...(earlierConflictThread?.title ? { threadTitle: earlierConflictThread.title } : {}),
+          checkpointTurnCount: earlierConflictTurnCount,
+          turnId: conflictSelection.earlier.turnId,
+        },
+        current: {
+          providerName: conflictSelection.current.providerName,
+          ...(activeThread?.title ? { threadTitle: activeThread.title } : {}),
+          checkpointTurnCount: conflictSelection.current.checkpointTurnCount,
+          turnId: conflictSelection.current.turnId,
+        },
+        sameThread: conflictSelection.earlier.threadId === conflictSelection.current.threadId,
+      })
+    : null;
+  const selectedProvenanceChangeSet = useMemo(() => {
+    if (!selectedTurn || !activeThread) return undefined;
+    return readProvenanceTurnChangeSets(activeThread.activities).find(
+      (changeSet) => changeSet.turnId === selectedTurn.turnId,
+    );
+  }, [activeThread, selectedTurn]);
+  const selectedProvenanceOwner = selectedProvenanceChangeSet?.mutations[0];
+  const selectedProvenanceOwnership = useMemo(
+    () =>
+      selectedProvenanceChangeSet?.mutations.flatMap((mutation) =>
+        mutation.lineRanges && mutation.lineRanges.length > 0
+          ? [
+              {
+                filePath: mutation.path,
+                lineRanges: mutation.lineRanges,
+                label: `${mutation.providerName} · turn ${mutation.checkpointTurnCount ?? "?"} · ${mutation.action}`,
+                ...(selectedAssistantMessageId && onRevealConversationMessage
+                  ? {
+                      onRevealConversation: () =>
+                        onRevealConversationMessage(selectedAssistantMessageId),
+                    }
+                  : {}),
+              },
+            ]
+          : [],
+      ) ?? [],
+    [onRevealConversationMessage, selectedAssistantMessageId, selectedProvenanceChangeSet],
+  );
+  const selectedCheckpointTurnCount = conflictSelection
+    ? (conflictSelection.current.checkpointTurnCount ??
+      selectedProvenanceChangeSet?.checkpointTurnCount)
+    : selectedTurn &&
+      (selectedTurn.checkpointTurnCount ??
+        inferredCheckpointTurnCountByTurnId[selectedTurn.turnId]);
   const latestTurn = orderedTurnDiffSummaries[0];
-  const selectedScopeLabel =
-    selectedTurnId === null
+  const selectedScopeLabel = conflictSelection
+    ? "Conflict review"
+    : selectedTurnId === null
       ? selectedGitScope === "unstaged"
         ? "Working tree"
         : "Branch changes"
@@ -254,9 +506,25 @@ export default function DiffPanel({
       fromTurnCount: selectedCheckpointRange?.fromTurnCount ?? null,
       toTurnCount: selectedCheckpointRange?.toTurnCount ?? null,
       ignoreWhitespace: diffIgnoreWhitespace,
-      cacheScope: selectedTurn ? `turn:${selectedTurn.turnId}` : null,
+      cacheScope: conflictSelection
+        ? `conflict-current:${conflictSelection.current.turnId}`
+        : selectedTurn
+          ? `turn:${selectedTurn.turnId}`
+          : null,
     },
-    { enabled: isGitRepo && selectedTurn !== undefined },
+    { enabled: isGitRepo && (selectedTurn !== undefined || conflictSelection !== null) },
+  );
+  const earlierConflictDiff = useCheckpointDiff(
+    {
+      environmentId: activeThread?.environmentId ?? null,
+      threadId: conflictSelection?.earlier.threadId ?? null,
+      fromTurnCount:
+        earlierConflictTurnCount === null ? null : Math.max(0, earlierConflictTurnCount - 1),
+      toTurnCount: earlierConflictTurnCount,
+      ignoreWhitespace: diffIgnoreWhitespace,
+      cacheScope: conflictSelection ? `conflict-earlier:${conflictSelection.earlier.turnId}` : null,
+    },
+    { enabled: isGitRepo && conflictSelection !== null && earlierConflictTurnCount !== null },
   );
   const primaryBranchDiffPreview = useEnvironmentQuery(
     selectedTurnId === null && activeThread && activeCwd
@@ -392,14 +660,18 @@ export default function DiffPanel({
   ];
   const gitDiff = selectedGitSource?.diff;
 
-  const selectedPatch = selectedTurn ? activeCheckpointDiff.data?.diff : gitDiff;
+  const selectedPatch =
+    selectedTurn || conflictSelection ? activeCheckpointDiff.data?.diff : gitDiff;
   const isSelectedPatchTruncated = !selectedTurn && selectedGitSource?.truncated === true;
-  const isLoadingSelectedPatch = selectedTurn
-    ? activeCheckpointDiff.isPending
-    : branchDiffPreview.isPending;
-  const selectedPatchError = selectedTurn ? activeCheckpointDiff.error : branchDiffPreview.error;
+  const isLoadingSelectedPatch =
+    selectedTurn || conflictSelection
+      ? activeCheckpointDiff.isPending
+      : branchDiffPreview.isPending;
+  const selectedPatchError =
+    selectedTurn || conflictSelection ? activeCheckpointDiff.error : branchDiffPreview.error;
   const hasResolvedPatch = typeof selectedPatch === "string";
   const hasNoNetChanges = hasResolvedPatch && selectedPatch.trim().length === 0;
+  const canExportTurnPatch = selectedTurnId !== null && hasResolvedPatch && !hasNoNetChanges;
   const renderablePatch = useMemo(
     () =>
       getRenderablePatch(selectedPatch, `diff-panel:${resolvedTheme}`, {
@@ -614,6 +886,44 @@ export default function DiffPanel({
             </DropdownMenuSub>
           </DropdownMenuContent>
         </DropdownMenu>
+        {conflictSelection ? (
+          <div className="hidden min-w-0 items-center gap-1.5 text-xs text-muted-foreground sm:flex">
+            <span className="truncate font-medium text-foreground/80">
+              {conflictSelection.earlier.providerName}
+            </span>
+            <ArrowRightIcon className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+            <span className="truncate font-medium text-foreground/80">
+              {conflictSelection.current.providerName}
+            </span>
+            <span className="max-w-48 truncate font-mono text-[10px]">
+              · {conflictSelection.filePath}
+            </span>
+          </div>
+        ) : selectedTurnId !== null ? (
+          <div
+            className="hidden min-w-0 max-w-64 items-center gap-1.5 truncate text-xs text-muted-foreground sm:flex"
+            aria-label={
+              selectedProvenanceOwner
+                ? `Turn owner ${selectedProvenanceOwner.providerName}`
+                : "Turn ownership unavailable"
+            }
+          >
+            {selectedProvenanceOwner ? (
+              <>
+                <span className="text-muted-foreground/60">Owner</span>
+                <span className="truncate font-medium text-foreground/80">
+                  {selectedProvenanceOwner.providerName}
+                </span>
+                <span className="truncate">· {selectedProvenanceOwner.action}</span>
+                {selectedProvenanceOwnership.length === 0 ? (
+                  <span className="text-warning">· file-level only</span>
+                ) : null}
+              </>
+            ) : (
+              <span className="text-warning">Ownership unavailable · review context</span>
+            )}
+          </div>
+        ) : null}
         {selectedTurnId === null && selectedGitScope === "branch" && selectedGitSource?.baseRef && (
           <div
             className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden text-xs text-muted-foreground"
@@ -775,6 +1085,55 @@ export default function DiffPanel({
             </TooltipPopup>
           </Tooltip>
         )}
+        {canExportTurnPatch && selectedPatch ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Export this turn as a Git patch"
+                  onClick={() =>
+                    downloadProvenancePatch(
+                      buildProvenancePatchFilename({
+                        turnId: selectedTurnId,
+                        ...(selectedProvenanceOwner
+                          ? { providerName: selectedProvenanceOwner.providerName }
+                          : {}),
+                        ...(typeof selectedCheckpointTurnCount === "number"
+                          ? { turnCount: selectedCheckpointTurnCount }
+                          : {}),
+                      }),
+                      selectedPatch,
+                    )
+                  }
+                />
+              }
+            >
+              <DownloadIcon className="size-3.5" />
+            </TooltipTrigger>
+            <TooltipPopup side="top">Export turn patch</TooltipPopup>
+          </Tooltip>
+        ) : null}
+        {selectedAssistantMessageId && onRevealConversationMessage ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Open the conversation that produced this turn"
+                  onClick={() => onRevealConversationMessage(selectedAssistantMessageId)}
+                />
+              }
+            >
+              <MessageSquareTextIcon className="size-3.5" />
+            </TooltipTrigger>
+            <TooltipPopup side="top">Open producing conversation</TooltipPopup>
+          </Tooltip>
+        ) : null}
         {codeViewFiles.length > 0 && (
           <Tooltip>
             <TooltipTrigger
@@ -894,6 +1253,84 @@ export default function DiffPanel({
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
           Turn diffs are unavailable because this project is not a git repository.
         </div>
+      ) : conflictSelection ? (
+        <div className="@container/conflict flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
+          <div className="shrink-0 border-b border-border/60 bg-warning/[0.035]">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-[11px] text-muted-foreground">
+              <span className="font-medium text-warning-foreground">Competing changes</span>
+              <span className="min-w-0 truncate font-mono text-foreground/80">
+                {conflictSelection.filePath}
+              </span>
+              <span className="rounded-full bg-warning/8 px-2 py-0.5 text-[10px] text-warning-foreground/80">
+                {formatConflictReviewScope(conflictSelection.lineRanges)}
+              </span>
+              <Button
+                className="ml-auto"
+                onClick={() => openDiffFile(conflictSelection.filePath)}
+                size="xs"
+                variant="ghost"
+              >
+                <FileCode2Icon aria-hidden="true" />
+                Open file
+              </Button>
+            </div>
+            {conflictRecommendation ? (
+              <div className="flex items-start gap-2 border-t border-warning/10 px-3 py-2 text-[11px]">
+                <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full bg-info/10 text-info">
+                  <ShieldCheckIcon className="size-3" aria-hidden="true" />
+                </span>
+                <div className="min-w-0">
+                  <div className="font-medium text-foreground/90">
+                    Recommended: {conflictRecommendation.title}
+                  </div>
+                  <div className="text-muted-foreground">{conflictRecommendation.detail}</div>
+                </div>
+                <span className="ml-auto hidden shrink-0 rounded-full border border-border/50 px-2 py-0.5 text-[9px] text-muted-foreground @xl/conflict:inline-flex">
+                  Review only · no code changed
+                </span>
+              </div>
+            ) : null}
+          </div>
+          <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-auto p-2 @4xl/conflict:grid-cols-2 @4xl/conflict:overflow-hidden">
+            <ConflictDiffColumn
+              side="Earlier"
+              turn={{
+                ...conflictSelection.earlier,
+                checkpointTurnCount: earlierConflictTurnCount,
+              }}
+              filePath={conflictSelection.filePath}
+              lineRanges={conflictSelection.lineRanges}
+              patch={earlierConflictDiff.data?.diff}
+              error={earlierConflictDiff.error}
+              isLoading={earlierConflictDiff.isPending}
+              composerDraftTarget={composerDraftTarget}
+              resolvedTheme={resolvedTheme as DiffThemeType}
+              diffRenderMode={diffRenderMode}
+              wordWrap={wordWrap}
+              {...(earlierConflictAssistantMessageId
+                ? { conversationMessageId: earlierConflictAssistantMessageId }
+                : {})}
+              {...(onRevealConversationMessage ? { onRevealConversationMessage } : {})}
+            />
+            <ConflictDiffColumn
+              side="Current"
+              turn={conflictSelection.current}
+              filePath={conflictSelection.filePath}
+              lineRanges={conflictSelection.lineRanges}
+              patch={activeCheckpointDiff.data?.diff}
+              error={activeCheckpointDiff.error}
+              isLoading={activeCheckpointDiff.isPending}
+              composerDraftTarget={composerDraftTarget}
+              resolvedTheme={resolvedTheme as DiffThemeType}
+              diffRenderMode={diffRenderMode}
+              wordWrap={wordWrap}
+              {...(selectedAssistantMessageId
+                ? { conversationMessageId: selectedAssistantMessageId }
+                : {})}
+              {...(onRevealConversationMessage ? { onRevealConversationMessage } : {})}
+            />
+          </div>
+        </div>
       ) : selectedTurnId !== null && orderedTurnDiffSummaries.length === 0 ? (
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
           No completed turns yet.
@@ -976,6 +1413,7 @@ export default function DiffPanel({
                     codeViewKey={codeViewMountKey}
                     className="h-full min-h-0 overflow-auto"
                     files={codeViewFiles}
+                    ownership={selectedProvenanceOwnership}
                     sectionId={reviewSectionId}
                     sectionTitle={reviewSectionTitle}
                     composerDraftTarget={composerDraftTarget}

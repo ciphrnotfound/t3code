@@ -55,6 +55,7 @@ import {
 } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { providerWorkspaceMismatch, workspacePathsEqual } from "../../provenance/config.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
@@ -70,8 +71,7 @@ type ProviderIntentEvent = Extract<
       | "thread.turn-interrupt-requested"
       | "thread.approval-response-requested"
       | "thread.user-input-response-requested"
-      | "thread.session-stop-requested"
-      | "thread.settled";
+      | "thread.session-stop-requested";
   }
 >;
 
@@ -388,6 +388,41 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const appendWorktreeIntegrityFailureActivity = (input: {
+    readonly threadId: ThreadId;
+    readonly expectedWorktreePath: string;
+    readonly actualCwd: string | undefined;
+    readonly createdAt: string;
+  }) =>
+    Effect.all({
+      commandId: serverCommandId("worktree-integrity-failure"),
+      eventId: serverEventId(),
+    }).pipe(
+      Effect.flatMap(({ commandId, eventId }) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: eventId,
+            tone: "error",
+            kind: "provenance.worktree.mismatch.detected",
+            summary: "Provider did not honor the assigned directory",
+            payload: {
+              origin: "t3-provenance",
+              expectedWorktreePath: input.expectedWorktreePath,
+              actualCwd: input.actualCwd ?? "unknown",
+              threadId: input.threadId,
+              blocked: true,
+            },
+            turnId: null,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
   const formatFailureDetail = (cause: Cause.Cause<unknown>): string => {
     const failReason = cause.reasons.find(Cause.isFailReason);
     if (isProviderAdapterRequestError(failReason?.error)) {
@@ -538,7 +573,7 @@ const make = Effect.gen(function* () {
 
   const resolveThreadDetail = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
-      .getThreadDetailById(threadId, { activityKinds: [] })
+      .getThreadDetailById(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
@@ -592,7 +627,9 @@ const make = Effect.gen(function* () {
     const resolveActiveSession = (threadId: ThreadId) =>
       providerService
         .listSessions()
-        .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
+        .pipe(
+          Effect.map((sessions) => sessions.findLast((session) => session.threadId === threadId)),
+        );
 
     const activeSession = yield* resolveActiveSession(threadId);
     const activeThreadSession =
@@ -768,7 +805,7 @@ const make = Effect.gen(function* () {
       thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
     if (existingSessionThreadId) {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
-      const cwdChanged = effectiveCwd !== activeSession?.cwd;
+      const cwdChanged = !workspacePathsEqual(effectiveCwd, activeSession?.cwd);
       const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
         .sessionModelSwitch;
       const modelChanged =
@@ -851,6 +888,11 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
+    const project = yield* resolveProject(thread.projectId);
+    const effectiveCwd = resolveThreadWorkspaceCwd({
+      thread,
+      projects: project ? [project] : [],
+    });
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
       pendingTurnStart: true,
@@ -863,8 +905,27 @@ const make = Effect.gen(function* () {
     const activeSession = yield* providerService
       .listSessions()
       .pipe(
-        Effect.map((sessions) => sessions.find((session) => session.threadId === input.threadId)),
+        Effect.map((sessions) =>
+          sessions.findLast((session) => session.threadId === input.threadId),
+        ),
       );
+    if (
+      effectiveCwd !== null &&
+      effectiveCwd !== undefined &&
+      providerWorkspaceMismatch(effectiveCwd, activeSession?.cwd)
+    ) {
+      yield* appendWorktreeIntegrityFailureActivity({
+        threadId: input.threadId,
+        expectedWorktreePath: effectiveCwd,
+        actualCwd: activeSession?.cwd,
+        createdAt: input.createdAt,
+      });
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabel(activeSession?.provider ?? thread.modelSelection.instanceId),
+        method: "thread.turn.start",
+        detail: `Worktree integrity check failed. Expected provider cwd '${effectiveCwd}', received '${activeSession?.cwd ?? "unknown"}'. The turn was not started.`,
+      });
+    }
     const sessionModelSwitch =
       activeSession === undefined
         ? "in-session"
@@ -1734,24 +1795,6 @@ const make = Effect.gen(function* () {
       case "thread.session-stop-requested":
         yield* processSessionStopRequested(event);
         return;
-      case "thread.settled": {
-        const thread = yield* projectionSnapshotQuery.getThreadShellById(event.payload.threadId);
-        if (
-          Option.isNone(thread) ||
-          thread.value.session == null ||
-          thread.value.session.status === "stopped"
-        ) {
-          return;
-        }
-        yield* orchestrationEngine.dispatch({
-          type: "thread.session.stop",
-          commandId: CommandId.make(`session-stop-for-settle:${event.commandId ?? event.eventId}`),
-          threadId: event.payload.threadId,
-          createdAt: event.occurredAt,
-          onlyIfSettled: true,
-        });
-        return;
-      }
     }
   });
 
@@ -1790,8 +1833,7 @@ const make = Effect.gen(function* () {
         event.type === "thread.turn-interrupt-requested" ||
         event.type === "thread.approval-response-requested" ||
         event.type === "thread.user-input-response-requested" ||
-        event.type === "thread.session-stop-requested" ||
-        event.type === "thread.settled"
+        event.type === "thread.session-stop-requested"
       ) {
         return yield* worker.enqueue(event);
       }

@@ -18,10 +18,17 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
+import * as NodeCrypto from "node:crypto";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 
-import { parseTurnDiffFilesFromNumstat } from "../../checkpointing/Diffs.ts";
+import {
+  classifyTurnDiffFileOperations,
+  parseTurnDiffFileRanges,
+  parseTurnDiffFilesFromUnifiedDiff,
+  parseTurnDiffRenameSources,
+  parseTurnDiffUnsupportedPaths,
+} from "../../checkpointing/Diffs.ts";
 import {
   checkpointRefForThreadTurn,
   resolveThreadWorkspaceCwd,
@@ -38,6 +45,12 @@ import type { OrchestrationDispatchError } from "../Errors.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
+import { findFileOverlaps, type ProvenanceMutation } from "../../provenance/FileOverlap.ts";
+import { readPersistedProvenanceHistory } from "../../provenance/PersistedHistory.ts";
+import { summarizeProvenanceTurn } from "../../provenance/TurnSummary.ts";
+import { shouldAppendRevertFailure } from "../../provenance/FailureDedup.ts";
+import { isProvenanceEnabled, worktreeMismatch } from "../../provenance/config.ts";
+import { VcsDriverRegistry } from "../../vcs/VcsDriverRegistry.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -60,6 +73,22 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
+}
+
+function latestToolAction(
+  activities: ReadonlyArray<{
+    readonly turnId: TurnId | null;
+    readonly kind: string;
+    readonly summary: string;
+  }>,
+  turnId: TurnId,
+): string {
+  return (
+    activities
+      .toReversed()
+      .find((activity) => activity.turnId === turnId && activity.kind === "tool.completed")
+      ?.summary ?? "unknown"
+  );
 }
 
 function checkpointStatusFromRuntime(status: string | undefined): "ready" | "missing" | "error" {
@@ -87,42 +116,63 @@ const make = Effect.gen(function* () {
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const receiptBus = yield* RuntimeReceiptBus;
   const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+  const vcsDriverRegistry = yield* VcsDriverRegistry;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const startedTurns = new Map<ThreadId, TurnId>();
   const pending = new Set<ThreadId>();
+  const provenanceHistory = new Map<string, Array<ProvenanceMutation>>();
+  const hydratedProvenanceWorkspaces = new Set<string>();
+  const activeProvenanceDiffFingerprints = new Map<string, string>();
+  const turnBaselineDirtyFiles = new Map<string, ReadonlySet<string>>();
+  const externalOverlapFingerprints = new Set<string>();
+  const worktreeMismatchFingerprints = new Set<string>();
+  // Provenance is additive to normal checkpointing and can be disabled for
+  // operators diagnosing regressions without changing revert semantics.
+  const provenanceEnabled = isProvenanceEnabled();
 
-  const appendRevertFailureActivity = (input: {
+  const appendRevertFailureActivity = Effect.fn("appendRevertFailureActivity")(function* (input: {
     readonly threadId: ThreadId;
     readonly turnCount: number;
     readonly detail: string;
     readonly createdAt: string;
-  }) =>
-    Effect.all({
+  }) {
+    const thread = yield* projectionSnapshotQuery
+      .getThreadDetailById(input.threadId)
+      .pipe(Effect.orElseSucceed(() => Option.none()));
+    if (
+      Option.isSome(thread) &&
+      !shouldAppendRevertFailure(thread.value.activities, {
+        turnCount: input.turnCount,
+        detail: input.detail,
+      })
+    ) {
+      return;
+    }
+
+    const { commandId, activityId } = yield* Effect.all({
       commandId: serverCommandId("checkpoint-revert-failure"),
       activityId: serverEventId,
-    }).pipe(
-      Effect.flatMap(({ commandId, activityId }) =>
-        orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId: input.threadId,
-          activity: {
-            id: activityId,
-            tone: "error",
-            kind: "checkpoint.revert.failed",
-            summary: "Checkpoint revert failed",
-            payload: {
-              turnCount: input.turnCount,
-              detail: input.detail,
-            },
-            turnId: null,
-            createdAt: input.createdAt,
-          },
-          createdAt: input.createdAt,
-        }),
-      ),
-    );
+    });
+    yield* orchestrationEngine.dispatch({
+      type: "thread.activity.append",
+      commandId,
+      threadId: input.threadId,
+      activity: {
+        id: activityId,
+        tone: "error",
+        kind: "checkpoint.revert.failed",
+        summary: "Checkpoint revert failed",
+        payload: {
+          turnCount: input.turnCount,
+          detail: input.detail,
+        },
+        turnId: null,
+        createdAt: input.createdAt,
+      },
+      createdAt: input.createdAt,
+    });
+  });
 
   const appendCaptureFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -167,7 +217,7 @@ const make = Effect.gen(function* () {
 
   const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
-      .getThreadDetailById(threadId, { activityKinds: [] })
+      .getThreadDetailById(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
@@ -180,6 +230,20 @@ const make = Effect.gen(function* () {
     return project ? [project] : [];
   });
 
+  const ensureProvenanceHistory = Effect.fn("ensureProvenanceHistory")(function* (
+    workspaceKey: string,
+  ) {
+    if (hydratedProvenanceWorkspaces.has(workspaceKey)) {
+      return provenanceHistory.get(workspaceKey) ?? [];
+    }
+    const activities = projectionSnapshotQuery.getProvenanceActivities
+      ? yield* projectionSnapshotQuery.getProvenanceActivities()
+      : (yield* projectionSnapshotQuery.getSnapshot()).threads.flatMap((thread) => thread.activities);
+    const history = [...readPersistedProvenanceHistory([{ activities }], workspaceKey)];
+    provenanceHistory.set(workspaceKey, history);
+    hydratedProvenanceWorkspaces.add(workspaceKey);
+    return history;
+  });
   // Resolves the workspace CWD for checkpoint operations, preferring the
   // active provider session CWD and falling back to the thread/project config.
   // Returns undefined when no CWD can be determined or the workspace is not
@@ -225,6 +289,13 @@ const make = Effect.gen(function* () {
         readonly id: MessageId;
         readonly role: string;
         readonly turnId: TurnId | null;
+        readonly text: string;
+      }>;
+      readonly session: { readonly providerName: string | null } | null;
+      readonly activities: ReadonlyArray<{
+        readonly turnId: TurnId | null;
+        readonly kind: string;
+        readonly summary: string;
       }>;
     };
     readonly cwd: string;
@@ -258,47 +329,178 @@ const make = Effect.gen(function* () {
     // reflects files created or deleted during this turn.
     yield* workspaceEntries.refresh(input.cwd);
 
-    // Git may have been initialized during this turn, leaving no pre-turn
-    // snapshot. Keep the completion checkpoint for future turns, but do not
-    // invent a baseline or attempt a diff against a ref that does not exist.
-    const files = yield* (
-      fromCheckpointExists
-        ? checkpointStore.diffCheckpoints({
-            cwd: input.cwd,
-            fromCheckpointRef,
-            toCheckpointRef: targetCheckpointRef,
-            fallbackFromToHead: false,
-            ignoreWhitespace: false,
-            format: "numstat",
-          })
-        : Effect.succeed("")
-    ).pipe(
-      Effect.map((diff) =>
-        parseTurnDiffFilesFromNumstat(diff).map((file) => ({
-          path: file.path,
-          kind: "modified" as const,
-          additions: file.additions,
-          deletions: file.deletions,
-        })),
-      ),
-      Effect.tapError((error) =>
-        appendCaptureFailureActivity({
-          threadId: input.threadId,
-          turnId: input.turnId,
-          detail: `Checkpoint captured, but turn diff summary is unavailable: ${error.message}`,
-          createdAt: input.createdAt,
-        }),
-      ),
-      Effect.catch((error) =>
-        Effect.logWarning("failed to derive checkpoint file summary", {
-          threadId: input.threadId,
-          turnId: input.turnId,
-          turnCount: input.turnCount,
-          detail: error.message,
-        }).pipe(Effect.as([])),
-      ),
-    );
+    const { files, operationByPath, rangesByPath, renameSourceByPath, unsupportedPaths } =
+      yield* checkpointStore
+        .diffCheckpoints({
+          cwd: input.cwd,
+          fromCheckpointRef,
+          toCheckpointRef: targetCheckpointRef,
+          fallbackFromToHead: false,
+          ignoreWhitespace: false,
+        })
+        .pipe(
+          Effect.map((diff) => {
+            const operationByPath = classifyTurnDiffFileOperations(diff);
+            const rangesByPath = parseTurnDiffFileRanges(diff);
+            const renameSourceByPath = parseTurnDiffRenameSources(diff);
+            const parsedFiles = parseTurnDiffFilesFromUnifiedDiff(diff);
+            const unsupportedPaths = parseTurnDiffUnsupportedPaths(diff);
+            return {
+              files: [
+                ...parsedFiles.map((file) => ({
+                  path: file.path,
+                  kind: "modified" as const,
+                  additions: file.additions,
+                  deletions: file.deletions,
+                })),
+                ...unsupportedPaths
+                  .filter((path) => !parsedFiles.some((file) => file.path === path))
+                  .map((path) => ({ path, kind: "modified" as const, additions: 0, deletions: 0 })),
+              ],
+              operationByPath,
+              rangesByPath,
+              renameSourceByPath,
+              unsupportedPaths,
+            };
+          }),
+          Effect.tapError((error) =>
+            appendCaptureFailureActivity({
+              threadId: input.threadId,
+              turnId: input.turnId,
+              detail: `Checkpoint captured, but turn diff summary is unavailable: ${error.message}`,
+              createdAt: input.createdAt,
+            }),
+          ),
+          Effect.catch((error) =>
+            Effect.logWarning("failed to derive checkpoint file summary", {
+              threadId: input.threadId,
+              turnId: input.turnId,
+              turnCount: input.turnCount,
+              detail: error.message,
+            }).pipe(
+              Effect.as({
+                files: [],
+                operationByPath: new Map<string, string>(),
+                rangesByPath: new Map<
+                  string,
+                  ReadonlyArray<{ readonly start: number; readonly end: number }>
+                >(),
+                renameSourceByPath: new Map<string, string>(),
+                unsupportedPaths: [] as ReadonlyArray<string>,
+              }),
+            ),
+          ),
+        );
 
+    const currentMutations: Array<ProvenanceMutation> = files.map((file) => {
+      const lineRanges = rangesByPath.get(file.path);
+      const operation = operationByPath.get(file.path) ?? "modified";
+      return {
+        workspaceKey: input.cwd,
+        threadId: input.threadId,
+        turnId: input.turnId,
+        checkpointTurnCount: input.turnCount,
+        checkpointRef: targetCheckpointRef,
+        completedAt: input.createdAt,
+        providerName: input.thread.session?.providerName ?? "unknown",
+        operation,
+        action: latestToolAction(input.thread.activities, input.turnId),
+        path: file.path,
+        ...(renameSourceByPath.has(file.path)
+          ? { previousPath: renameSourceByPath.get(file.path)! }
+          : {}),
+        ...(unsupportedPaths.includes(file.path) || operation === "renamed"
+          ? { undoable: false }
+          : {}),
+        ...(lineRanges ? { lineRanges } : {}),
+      };
+    });
+    const history = provenanceEnabled ? yield* ensureProvenanceHistory(input.cwd) : [];
+    const turnSummary = summarizeProvenanceTurn(
+      input.thread.messages
+        .toReversed()
+        .find((message) => message.role === "assistant" && message.turnId === input.turnId)?.text,
+    );
+    // Persist the complete turn-level mutation record so clients can review and
+    // safely preview undo without relying on the in-memory overlap index.
+    if (provenanceEnabled) {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provenance-turn-completed"),
+        threadId: input.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "info",
+          kind: "provenance.turn.completed",
+          summary: "Agent turn change set recorded",
+          payload: {
+            origin: "t3-provenance",
+            workspaceKey: input.cwd,
+            threadId: input.threadId,
+            turnId: input.turnId,
+            providerName: input.thread.session?.providerName ?? "unknown",
+            beforeCheckpointRef: fromCheckpointRef,
+            afterCheckpointRef: targetCheckpointRef,
+            checkpointTurnCount: input.turnCount,
+            completedAt: input.createdAt,
+            status: input.status,
+            ...(turnSummary ? { turnSummary } : {}),
+            mutations: currentMutations,
+          },
+          turnId: input.turnId,
+          createdAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
+      });
+    }
+    const overlaps = provenanceEnabled
+      ? findFileOverlaps([...history, ...currentMutations]).filter(
+          (overlap) =>
+            overlap.later.threadId === input.threadId && overlap.later.turnId === input.turnId,
+        )
+      : [];
+    if (provenanceEnabled) {
+      provenanceHistory.set(input.cwd, [...history, ...currentMutations].slice(-2_000));
+    }
+
+    for (const overlap of overlaps) {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provenance-overlap"),
+        threadId: input.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "error",
+          kind: "provenance.overlap.detected",
+          summary: "Another T3 thread changed this file",
+          payload: {
+            origin: "t3-agent",
+            workspaceKey: overlap.workspaceKey,
+            path: overlap.path,
+            earlierOperation: overlap.earlier.operation,
+            currentOperation: overlap.later.operation,
+            lineRanges: overlap.lineRanges,
+            earlierAction: overlap.earlier.action,
+            currentAction: overlap.later.action,
+            earlierThreadId: overlap.earlier.threadId,
+            earlierTurnId: overlap.earlier.turnId,
+            earlierCheckpointTurnCount: overlap.earlier.checkpointTurnCount,
+            earlierCheckpointRef: overlap.earlier.checkpointRef,
+            earlierProvider: overlap.earlier.providerName,
+            currentThreadId: overlap.later.threadId,
+            currentTurnId: overlap.later.turnId,
+            currentCheckpointTurnCount: overlap.later.checkpointTurnCount,
+            currentCheckpointRef: overlap.later.checkpointRef,
+            currentProvider: overlap.later.providerName,
+            checkpointRef: overlap.later.checkpointRef,
+            note: "Historical file overlap detected; inspect the diff before treating it as a conflict.",
+          },
+          turnId: input.turnId,
+          createdAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
+      });
+    }
     const assistantMessageId =
       input.assistantMessageId ??
       input.thread.messages
@@ -446,6 +648,23 @@ const make = Effect.gen(function* () {
       });
       if (!checkpointCwd) {
         return;
+      }
+
+      const baselineStatus = yield* vcsStatusBroadcaster.refreshLocalStatus(checkpointCwd).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("failed to capture pre-turn workspace status for provenance", {
+            threadId: thread.id,
+            turnId,
+            cwd: checkpointCwd,
+            detail: error.message,
+          }).pipe(Effect.as(null)),
+        ),
+      );
+      if (baselineStatus !== null) {
+        turnBaselineDirtyFiles.set(
+          `${thread.id}:${turnId}`,
+          new Set(baselineStatus.workingTree.files.map((file) => file.path)),
+        );
       }
 
       const currentTurnCount = thread.checkpoints.reduce(
@@ -630,6 +849,43 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    // Never capture provenance against the configured worktree when the live
+    // provider session is running elsewhere. That would attribute unrelated
+    // edits to this turn and make selective undo unsafe.
+    if (provenanceEnabled && thread.worktreePath !== null) {
+      const sessionRuntime = yield* resolveSessionRuntimeForThread(threadId);
+      if (
+        Option.isSome(sessionRuntime) &&
+        worktreeMismatch(thread.worktreePath, sessionRuntime.value.cwd)
+      ) {
+        const mismatchKey = `${threadId}:${thread.worktreePath}:${sessionRuntime.value.cwd}`;
+        if (!worktreeMismatchFingerprints.has(mismatchKey)) {
+          worktreeMismatchFingerprints.add(mismatchKey);
+          yield* orchestrationEngine.dispatch({
+            type: "thread.activity.append",
+            commandId: yield* serverCommandId("provenance-worktree-mismatch"),
+            threadId,
+            activity: {
+              id: EventId.make(yield* randomUUID),
+              tone: "error",
+              kind: "provenance.worktree.mismatch.detected",
+              summary: "Provider session is running in a different directory",
+              payload: {
+                origin: "t3-provenance",
+                expectedWorktreePath: thread.worktreePath,
+                actualCwd: sessionRuntime.value.cwd,
+                threadId,
+              },
+              turnId: null,
+              createdAt: event.occurredAt,
+            },
+            createdAt: event.occurredAt,
+          });
+        }
+        return;
+      }
+    }
+
     const projects = yield* resolveThreadProjects(thread.projectId);
     const checkpointCwd = yield* resolveCheckpointCwd({
       threadId,
@@ -684,20 +940,233 @@ const make = Effect.gen(function* () {
     }
 
     const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
+    const configuredCheckpointCwd =
+      event.payload.scope === "provenance-turn"
+        ? yield* resolveCheckpointCwd({
+            threadId: event.payload.threadId,
+            thread,
+            projects: yield* resolveThreadProjects(thread.projectId),
+            preferSessionRuntime: false,
+          })
+        : undefined;
+    const checkpointCwd =
+      configuredCheckpointCwd ??
+      Option.match(sessionRuntime, {
+        onNone: () => undefined,
+        onSome: (runtime) => runtime.cwd,
+      });
+    if (!checkpointCwd) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail:
+          event.payload.scope === "provenance-turn"
+            ? "Safe undo could not resolve a git checkout for this thread."
+            : "No active provider session with workspace cwd is bound to this thread.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+    if (!(yield* checkpointStore.isGitRepository(checkpointCwd))) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: "Checkpoints are unavailable because this project is not a git repository.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
+    if (event.payload.scope === "provenance-turn") {
+      const alreadyReverted = thread.activities.some((activity) => {
+        if (activity.kind !== "provenance.turn.reverted") return false;
+        const payload = activity.payload as { readonly turnCount?: unknown };
+        return payload.turnCount === event.payload.turnCount;
+      });
+      if (alreadyReverted) return;
+
+      if (event.payload.turnCount === 0) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: "A provenance turn needs a pre-turn checkpoint to undo safely.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      const beforeCheckpointRef = checkpointRefForThreadTurn(
+        event.payload.threadId,
+        event.payload.turnCount - 1,
+      );
+      const targetCheckpointRef = checkpointRefForThreadTurn(
+        event.payload.threadId,
+        event.payload.turnCount,
+      );
+      const vcsDriver = yield* vcsDriverRegistry.get("git");
+      // A normal unified diff carries three context lines. If a later turn
+      // changes one of those nearby lines, Git rejects a reversal even when
+      // the target turn's actual edits are independent. A zero-context patch
+      // contains only the target mutation; git apply still performs its own
+      // all-or-nothing workspace check before we mutate anything.
+      const reversePatchResult = yield* vcsDriver.execute({
+        operation: "provenance.safeUndo.diff",
+        cwd: checkpointCwd,
+        args: [
+          "diff",
+          "--patch",
+          "--unified=0",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          `${beforeCheckpointRef}^{commit}`,
+          `${targetCheckpointRef}^{commit}`,
+        ],
+        allowNonZeroExit: true,
+      });
+      const reversePatch =
+        reversePatchResult.exitCode === 0
+          ? reversePatchResult.stdout
+          : `__T3_SAFE_UNDO_ERROR__${reversePatchResult.stderr.trim() || "Checkpoint ref is unavailable for diff operation."}`;
+      if (reversePatch.startsWith("__T3_SAFE_UNDO_ERROR__")) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: reversePatch.slice("__T3_SAFE_UNDO_ERROR__".length),
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      const unsupportedUndoPaths = parseTurnDiffUnsupportedPaths(reversePatch);
+      const containsRename = [...classifyTurnDiffFileOperations(reversePatch).values()].includes(
+        "renamed",
+      );
+      if (reversePatch.trim().length === 0 || unsupportedUndoPaths.length > 0 || containsRename) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            reversePatch.trim().length === 0
+              ? "Safe undo stopped because this turn has no reversible text patch."
+              : "Safe undo stopped because binary or renamed files require manual review.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      const applicability = yield* vcsDriver.execute({
+        operation: "provenance.safeUndo.check",
+        cwd: checkpointCwd,
+        args: ["apply", "--reverse", "--check", "--unidiff-zero", "--whitespace=nowarn"],
+        stdin: reversePatch,
+        allowNonZeroExit: true,
+      });
+      if (applicability.exitCode !== 0) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Safe undo stopped because the current workspace conflicts with this turn. Review the diff and resolve it manually.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      if (event.payload.preview === true) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: yield* serverCommandId("provenance-undo-preview"),
+          threadId: event.payload.threadId,
+          activity: {
+            id: EventId.make(yield* randomUUID),
+            tone: "info",
+            kind: "provenance.turn.undo.previewed",
+            summary: "Recovery preview is ready",
+            payload: {
+              origin: "t3-provenance",
+              turnCount: event.payload.turnCount,
+              paths: parseTurnDiffFilesFromUnifiedDiff(reversePatch).map((file) => file.path),
+              checkedAt: now,
+            },
+            turnId: null,
+            createdAt: now,
+          },
+          createdAt: now,
+        });
+        return;
+      }
+      const applied = yield* vcsDriver.execute({
+        operation: "provenance.safeUndo.apply",
+        cwd: checkpointCwd,
+        // Apply the exact operation that passed the safety check above. Using
+        // --3way here makes Git consult the index and can fail even when the
+        // checked reverse patch applies cleanly to the working tree.
+        args: ["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn"],
+        stdin: reversePatch,
+        allowNonZeroExit: true,
+      });
+      if (applied.exitCode !== 0) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Safe undo could not be applied cleanly. Review the diff and resolve it manually.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      yield* workspaceEntries.refresh(checkpointCwd);
+      yield* vcsStatusBroadcaster
+        .refreshLocalStatus(checkpointCwd)
+        .pipe(Effect.catch(() => Effect.succeed(null)));
+      const revertedTurnId = thread.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
+      )?.turnId;
+      if (revertedTurnId) {
+        const workspaceHistory = provenanceHistory.get(checkpointCwd) ?? [];
+        provenanceHistory.set(
+          checkpointCwd,
+          workspaceHistory.filter(
+            (mutation) =>
+              mutation.threadId !== event.payload.threadId || mutation.turnId !== revertedTurnId,
+          ),
+        );
+      }
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provenance-turn-reverted"),
+        threadId: event.payload.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "info",
+          kind: "provenance.turn.reverted",
+          summary: "Safe undo applied",
+          payload: {
+            origin: "t3-provenance",
+            turnId: revertedTurnId,
+            turnCount: event.payload.turnCount,
+            beforeCheckpointRef,
+            targetCheckpointRef,
+            undoReceipt: {
+              version: 1,
+              scope: "code-only",
+              appliedAt: now,
+              patchSha256: NodeCrypto.createHash("sha256")
+                .update(reversePatch, "utf8")
+                .digest("hex"),
+              paths: parseTurnDiffFilesFromUnifiedDiff(reversePatch).map((file) => file.path),
+            },
+          },
+          turnId: null,
+          createdAt: now,
+        },
+        createdAt: now,
+      });
+      return;
+    }
+
     if (Option.isNone(sessionRuntime)) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
         detail: "No active provider session with workspace cwd is bound to this thread.",
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
-    }
-    if (!(yield* checkpointStore.isGitRepository(sessionRuntime.value.cwd))) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: "Checkpoints are unavailable because this project is not a git repository.",
         createdAt: now,
       }).pipe(Effect.catch(() => Effect.void));
       return;
@@ -823,6 +1292,105 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const publishLiveProvenance = Effect.fn("publishLiveProvenance")(function* (
+    event: Extract<ProviderRuntimeEvent, { type: "turn.diff.updated" }>,
+  ) {
+    const turnId = toTurnId(event.turnId);
+    if (!turnId) return;
+
+    const thread = yield* resolveThreadDetail(event.threadId);
+    if (!thread) return;
+    const projects = yield* resolveThreadProjects(thread.projectId);
+    const cwd = yield* resolveCheckpointCwd({
+      threadId: thread.id,
+      thread,
+      projects,
+      preferSessionRuntime: true,
+    });
+    if (!cwd) return;
+
+    const operationByPath = classifyTurnDiffFileOperations(event.payload.unifiedDiff);
+    const rangesByPath = parseTurnDiffFileRanges(event.payload.unifiedDiff);
+    const files = parseTurnDiffFilesFromUnifiedDiff(event.payload.unifiedDiff).map((file) => ({
+      path: file.path,
+      operation: operationByPath.get(file.path) ?? "modified",
+      additions: file.additions,
+      deletions: file.deletions,
+      lineRanges: rangesByPath.get(file.path),
+    }));
+    if (files.length === 0) return;
+
+    const baselineKey = `${event.threadId}:${turnId}`;
+    const baselineDirtyFiles = turnBaselineDirtyFiles.get(baselineKey) ?? new Set<string>();
+    const history = provenanceEnabled ? yield* ensureProvenanceHistory(cwd) : [];
+    const externalCandidates = files.filter(
+      (file) =>
+        baselineDirtyFiles.has(file.path) &&
+        !history.some((mutation) => mutation.path === file.path),
+    );
+    for (const file of externalCandidates) {
+      const externalKey = `${baselineKey}:${file.path}`;
+      if (externalOverlapFingerprints.has(externalKey)) continue;
+      externalOverlapFingerprints.add(externalKey);
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provenance-external-overlap"),
+        threadId: event.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "error",
+          kind: "provenance.external.overlap.detected",
+          summary: "Unknown external workspace change overlaps this turn",
+          payload: {
+            origin: "unknown-external",
+            workspaceKey: cwd,
+            path: file.path,
+            operation: file.operation,
+            lineRanges: file.lineRanges,
+            currentThreadId: event.threadId,
+            currentTurnId: turnId,
+            currentProvider: thread.session?.providerName ?? event.provider,
+            note: "The file was already dirty when this T3 turn started; the source is not identified.",
+          },
+          turnId,
+          createdAt: event.createdAt,
+        },
+        createdAt: event.createdAt,
+      });
+    }
+
+    const fingerprint = files
+      .map((file) => [file.path, file.operation, file.additions, file.deletions].join("\u0000"))
+      .join("\u0001");
+    const fingerprintKey = `${event.threadId}:${turnId}`;
+    if (activeProvenanceDiffFingerprints.get(fingerprintKey) === fingerprint) return;
+    activeProvenanceDiffFingerprints.set(fingerprintKey, fingerprint);
+
+    yield* orchestrationEngine.dispatch({
+      type: "thread.activity.append",
+      commandId: yield* serverCommandId("provenance-live"),
+      threadId: event.threadId,
+      activity: {
+        id: EventId.make(yield* randomUUID),
+        tone: "info",
+        kind: "provenance.mutation.observed",
+        summary: `${thread.session?.providerName ?? event.provider} is modifying ${files.length} file${files.length === 1 ? "" : "s"}`,
+        payload: {
+          origin: "t3-agent",
+          workspaceKey: cwd,
+          threadId: event.threadId,
+          turnId,
+          provider: thread.session?.providerName ?? event.provider,
+          action: latestToolAction(thread.activities, turnId),
+          files,
+          note: "Live attribution is based on the provider's in-progress turn diff.",
+        },
+        turnId,
+        createdAt: event.createdAt,
+      },
+      createdAt: event.createdAt,
+    });
+  });
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
@@ -846,7 +1414,18 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    if (event.type === "turn.diff.updated") {
+      yield* publishLiveProvenance(event);
+      return;
+    }
+
     if (event.type === "turn.completed" || event.type === "turn.aborted") {
+      const completedKey = `${event.threadId}:${event.turnId ?? ""}`;
+      activeProvenanceDiffFingerprints.delete(completedKey);
+      turnBaselineDirtyFiles.delete(completedKey);
+      for (const key of externalOverlapFingerprints) {
+        if (key.startsWith(`${completedKey}:`)) externalOverlapFingerprints.delete(key);
+      }
       const turnId = toTurnId(event.turnId);
       const thread = yield* resolveThreadDetail(event.threadId);
       const startedTurnId = startedTurns.get(event.threadId);
@@ -933,6 +1512,7 @@ const make = Effect.gen(function* () {
           event.type !== "turn.started" &&
           event.type !== "turn.completed" &&
           event.type !== "turn.aborted" &&
+          event.type !== "turn.diff.updated" &&
           event.type !== "session.exited"
         ) {
           return Effect.void;

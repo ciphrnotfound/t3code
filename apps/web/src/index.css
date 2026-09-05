@@ -269,12 +269,13 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
 
 @utility alert-glass {
   --alert-glass-tint: transparent;
+  --alert-glass-opacity: 74%;
   background:
     linear-gradient(
-      color-mix(in srgb, var(--alert-glass-tint) 4%, transparent),
-      color-mix(in srgb, var(--alert-glass-tint) 4%, transparent)
+      color-mix(in srgb, var(--alert-glass-tint) 7%, transparent),
+      color-mix(in srgb, var(--alert-glass-tint) 3%, transparent)
     ),
-    color-mix(in srgb, var(--background) var(--glass-opacity), transparent) !important;
+    color-mix(in srgb, var(--background) var(--alert-glass-opacity), transparent) !important;
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
 
@@ -296,6 +297,72 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
 
   @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
     background: var(--background) !important;
+  }
+}
+
+/* Chat safety notices behave like a compact inbox: only the foremost notice is
+   readable, while pending notices remain visible as quiet surfaces behind it. */
+.provenance-alert-stack {
+  pointer-events: none;
+  position: relative;
+  z-index: 20;
+  flex: none;
+}
+
+.provenance-alert-stack:has(> [data-alert-queue-item]) {
+  padding-block: 0.5rem;
+}
+
+.provenance-alert-stack:has(> [data-alert-queue-item]:nth-child(n + 2)) {
+  padding-bottom: 1.25rem;
+}
+
+.provenance-alert-stack > [data-alert-queue-item] {
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.provenance-alert-stack > [data-alert-queue-item]:first-child {
+  isolation: isolate;
+  z-index: 3;
+}
+
+.provenance-alert-stack > [data-alert-queue-item]:not(:first-child) {
+  display: none;
+}
+
+.provenance-alert-stack
+  > [data-alert-queue-item]:first-child:has(~ [data-alert-queue-item])::before,
+.provenance-alert-stack
+  > [data-alert-queue-item]:first-child:has(~ [data-alert-queue-item]:nth-child(n + 3))::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--background) 72%, transparent);
+  -webkit-backdrop-filter: blur(calc(var(--glass-blur) * 0.7)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(calc(var(--glass-blur) * 0.7)) saturate(var(--glass-saturation));
+  box-shadow: 0 12px 30px -25px rgb(0 0 0 / 58%);
+}
+
+.provenance-alert-stack
+  > [data-alert-queue-item]:first-child:has(~ [data-alert-queue-item])::before {
+  inset: 6px 10px -6px;
+  z-index: -1;
+}
+
+.provenance-alert-stack
+  > [data-alert-queue-item]:first-child:has(~ [data-alert-queue-item]:nth-child(n + 3))::after {
+  inset: 12px 20px -12px;
+  z-index: -2;
+  opacity: 0.72;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .provenance-alert-stack > [data-alert-queue-item] {
+    transition: none;
   }
 }
 

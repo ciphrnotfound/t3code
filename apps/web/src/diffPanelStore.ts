@@ -1,5 +1,5 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, TurnId } from "@t3tools/contracts";
+import type { ScopedThreadRef, ThreadId, TurnId } from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
@@ -8,7 +8,22 @@ import { resolveStorage } from "./lib/storage";
 export type DiffPanelSelection =
   | { kind: "branch"; baseRef: string | null }
   | { kind: "unstaged" }
-  | { kind: "turn"; turnId: TurnId; filePath: string | null; revealRequestId: number };
+  | { kind: "turn"; turnId: TurnId; filePath: string | null; revealRequestId: number }
+  | {
+      kind: "conflict";
+      filePath: string;
+      lineRanges: ReadonlyArray<{ readonly start: number; readonly end: number }>;
+      earlier: ConflictReviewTurn;
+      current: ConflictReviewTurn;
+    };
+
+export type ConflictReviewTurn = {
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId;
+  readonly checkpointTurnCount: number | null;
+  readonly providerName: string;
+  readonly action: string;
+};
 
 const DEFAULT_SELECTION: DiffPanelSelection = { kind: "branch", baseRef: null };
 const DEFAULT_WORKING_TREE_SELECTION: DiffPanelSelection = { kind: "unstaged" };
@@ -19,6 +34,10 @@ interface DiffPanelStoreState {
   selectGitScope: (ref: ScopedThreadRef, scope: "branch" | "unstaged") => void;
   selectBranchBaseRef: (ref: ScopedThreadRef, baseRef: string | null) => void;
   selectTurn: (ref: ScopedThreadRef, turnId: TurnId, filePath?: string) => void;
+  selectConflictReview: (
+    ref: ScopedThreadRef,
+    input: Extract<DiffPanelSelection, { kind: "conflict" }>,
+  ) => void;
   reconcileTurnSelection: (ref: ScopedThreadRef, availableTurnIds: ReadonlyArray<TurnId>) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
@@ -86,6 +105,13 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             },
           };
         }),
+      selectConflictReview: (ref, input) =>
+        set((state) => ({
+          byThreadKey: {
+            ...state.byThreadKey,
+            [scopedThreadKey(ref)]: input,
+          },
+        })),
       reconcileTurnSelection: (ref, availableTurnIds) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);

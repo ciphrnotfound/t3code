@@ -28,7 +28,12 @@ import {
 import { type EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
 import { wasBootstrapThreadDeleted } from "@t3tools/client-runtime/errors";
 import { type CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifact-templates";
-import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  changeRequestAutoSettles,
+  effectiveSettled,
+  effectiveSnoozed,
+  threadWokeAt,
+} from "@t3tools/client-runtime/state/thread-settled";
 import {
   codexFeedbackMessage,
   parseCodexFeedbackCommand,
@@ -46,9 +51,9 @@ import {
   createModelSelection,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
+import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/projectScripts";
 import { truncate } from "@t3tools/shared/String";
-import { resolveThreadReferenceCopyTarget } from "@t3tools/shared/threadReference";
 import {
   getTerminalLabel,
   nextTerminalId,
@@ -86,7 +91,7 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { isElectron } from "../env";
 import { readLocalApi } from "../localApi";
-import { useDiffPanelStore } from "../diffPanelStore";
+import { useDiffPanelStore, type ConflictReviewTurn } from "../diffPanelStore";
 import {
   collapseExpandedComposerCursor,
   type ComposerSubmissionIntent,
@@ -180,6 +185,11 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
+import { ProvenanceOverlapBanner } from "./ProvenanceOverlapBanner";
+import { ProvenanceTurnReviewCard } from "./ProvenanceTurnReviewCard";
+import { SafeUndoFailureAlert } from "./SafeUndoFailureAlert";
+import { SafeHistoryPanel } from "./SafeHistoryPanel";
+import { SafeIntegrationPanel } from "./SafeIntegrationPanel";
 import {
   deriveAgentPanelModel,
   foldSubagentActivities,
@@ -552,11 +562,7 @@ const TYPE_TO_FOCUS_INTERACTIVE_SELECTOR = [
   '[role="tab"]',
 ].join(",");
 const TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR = [
-  '[data-slot="alert-dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="command-dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="sheet-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="sidebar"][data-mobile="true"]:is([data-open],[data-ending-style])',
+  '[data-slot="dialog"]',
   '[data-slot="menu-popup"]',
   '[data-slot="select-popup"]',
   '[data-slot="popover-popup"]',
@@ -1833,6 +1839,11 @@ export default function ChatView(props: ChatViewProps) {
     setTimelineAnchor({ threadKey: activeThreadKey, messageId: null });
   }
   const timelineAnchorMessageId = timelineAnchor.messageId;
+  const [conversationRevealRequest, setConversationRevealRequest] = useState<{
+    readonly messageId: MessageId;
+    readonly requestId: number;
+  } | null>(null);
+  const conversationRevealRequestIdRef = useRef(0);
   const activeRightPanelKind = useRightPanelStore((state) =>
     selectActiveRightPanel(state.byThreadKey, activeThreadRef),
   );
@@ -2611,6 +2622,21 @@ export default function ChatView(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
+  // Current step for the in-chat working row: only for the running turn's own
+  // plan (deriveActivePlanState falls back to older turns' plans, which must
+  // not label fresh work). Falls back to the first pending step so an
+  // all-pending freshly written plan labels the row, matching the composer and
+  // the server's planProgress.
+  const workingStepLabel = useMemo(() => {
+    if (!activePlan || activePlan.turnId !== (activeLatestTurn?.turnId ?? null)) {
+      return null;
+    }
+    return (
+      activePlan.steps.find((step) => step.status === "inProgress")?.step ??
+      activePlan.steps.find((step) => step.status === "pending")?.step ??
+      null
+    );
+  }, [activeLatestTurn?.turnId, activePlan]);
   const showPlanFollowUpPrompt = shouldShowPlanFollowUpPrompt({
     pendingUserInputCount: pendingUserInputs.length,
     interactionMode,
@@ -2977,6 +3003,20 @@ export default function ChatView(props: ChatViewProps) {
     return byMessageId;
   }, [turnDiffSummaries]);
   const lastRevertTurnCountRef = useRef<Map<MessageId, number> | null>(null);
+  const assistantMessageIdByTurnId = useMemo(() => {
+    const byTurnId = new Map<TurnId, MessageId>();
+    for (const summary of turnDiffSummaries) {
+      if (summary.assistantMessageId) byTurnId.set(summary.turnId, summary.assistantMessageId);
+    }
+    return byTurnId;
+  }, [turnDiffSummaries]);
+  const userRequestByTurnId = useMemo(() => {
+    const byTurnId = new Map<TurnId, string>();
+    for (const message of activeThread?.messages ?? []) {
+      if (message.role === "user" && message.turnId) byTurnId.set(message.turnId, message.text);
+    }
+    return byTurnId;
+  }, [activeThread?.messages]);
   const revertTurnCountByUserMessageId = useMemo(() => {
     const next = buildRevertTurnCountByUserMessageId(
       {
@@ -3060,6 +3100,11 @@ export default function ChatView(props: ChatViewProps) {
     setResumeCompactionPermanentlyDismissed,
   ]);
   const providerStatusBannerKey = getProviderStatusBannerKey(activeProviderStatus);
+  const [provenanceAlertsHidden, setProvenanceAlertsHidden] = useLocalStorage(
+    "t3code:provenance-alerts-hidden",
+    false,
+    Schema.Boolean,
+  );
   const [dismissedProviderStatusBannerKey, setDismissedProviderStatusBannerKey] = useState<
     string | null
   >(null);
@@ -3074,7 +3119,7 @@ export default function ChatView(props: ChatViewProps) {
   )
     ? activeProviderStatus
     : null;
-  const hasTimelineTopBanner = Boolean(visibleThreadError) || visibleProviderStatus !== null;
+  const hasTimelineTopBanner = Boolean(visibleThreadError);
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -3751,6 +3796,14 @@ export default function ChatView(props: ChatViewProps) {
   const addAgentsSurface = useCallback(() => {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
+  }, [activeThreadRef]);
+  const addHistorySurface = useCallback(() => {
+    if (!activeThreadRef) return;
+    useRightPanelStore.getState().open(activeThreadRef, "history");
+  }, [activeThreadRef]);
+  const addIntegrationSurface = useCallback(() => {
+    if (!activeThreadRef) return;
+    useRightPanelStore.getState().open(activeThreadRef, "integration");
   }, [activeThreadRef]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
@@ -4744,7 +4797,7 @@ export default function ChatView(props: ChatViewProps) {
             index: anchorIndex,
             animated: true,
             viewPosition: 0,
-            viewOffset: CHAT_TIMELINE_ANCHOR_OFFSET,
+            viewOffset: CHAT_LIST_ANCHOR_OFFSET,
           })
           .then(() => {
             if (positionedTimelineAnchorRef.current !== messageId) {
@@ -4759,6 +4812,30 @@ export default function ChatView(props: ChatViewProps) {
 
   const onToolOutputCollapsedAtEnd = useCallback(() => {
     composerRef.current?.restoreAfterTimelineReachedEnd();
+  }, []);
+  const revealConversationMessage = useCallback(
+    (messageId: MessageId) => {
+      cancelTimelineLiveFollowForUserNavigation();
+      if (shouldUseRightPanelSheet) {
+        closePreviewPanel();
+      }
+      conversationRevealRequestIdRef.current += 1;
+      setConversationRevealRequest({
+        messageId,
+        requestId: conversationRevealRequestIdRef.current,
+      });
+    },
+    [cancelTimelineLiveFollowForUserNavigation, closePreviewPanel, shouldUseRightPanelSheet],
+  );
+  const handleConversationRevealResult = useCallback((requestId: number, found: boolean) => {
+    setConversationRevealRequest((current) => (current?.requestId === requestId ? null : current));
+    if (!found) {
+      toastManager.add({
+        title: "Conversation message unavailable",
+        description: "The producing message is outside the loaded task history.",
+        type: "warning",
+      });
+    }
   }, []);
 
   const onIsAtEndChange = useCallback((isAtEnd: boolean) => {
@@ -4960,6 +5037,10 @@ export default function ChatView(props: ChatViewProps) {
         : null,
     [activeThreadBranch, activeWorktreePath, envMode, gitStatusQuery.data?.refName, isServerThread],
   );
+  // Settled state of the open thread, resolved exactly like the sidebar
+  // partition (same shell, same capability gate, same PR auto-settle input)
+  // so the banner and the sidebar row never disagree.
+  const activeThreadShell = useThreadShell(isServerThread ? activeThreadRef : null);
   const activeComposerTasksProgress = useMemo(() => {
     if (!activeLatestTurn || latestTurnSettled || activePlan?.turnId !== activeLatestTurn.turnId) {
       return null;
@@ -5016,7 +5097,6 @@ export default function ChatView(props: ChatViewProps) {
     composerTimelineInsetRef.current = 0;
     publishComposerOverlayHeight(composerOverlayElement.getBoundingClientRect().height);
   }, [activeThreadKey, composerOverlayElement, publishComposerOverlayHeight]);
-
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
 
@@ -5128,6 +5208,18 @@ export default function ChatView(props: ChatViewProps) {
   }, [activeThreadPr, openThreadPullRequest]);
   const pullRequestSurfaceAvailable =
     supportsPullRequests && activeThreadPr !== null && threadRepository !== null;
+  // Primitive slice of the displayed PR for the settle-rule memos below:
+  // resolveDisplayedThreadPr returns a fresh object every render, so memoize
+  // on the fields the rules read instead of the object identity.
+  const activeThreadPrState = activeThreadPr?.state ?? null;
+  const activeThreadPrUpdatedAt = activeThreadPr?.updatedAt ?? null;
+  const activeThreadChangeRequest = useMemo(
+    () =>
+      activeThreadPrState === null
+        ? null
+        : { state: activeThreadPrState, updatedAt: activeThreadPrUpdatedAt },
+    [activeThreadPrState, activeThreadPrUpdatedAt],
+  );
   const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
   const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
   const supportsPinning = serverConfig?.environment.capabilities.threadPinning === true;
@@ -5158,13 +5250,21 @@ export default function ChatView(props: ChatViewProps) {
     if (activeThreadRef === null || activeThreadWokeAt === null) return;
     markThreadVisited(scopedThreadKey(activeThreadRef), activeThreadWokeAt);
   }, [activeThreadRef, activeThreadWokeAt, markThreadVisited]);
-  // Mirror of the sidebar's Woke pill for the open thread.
+  // Mirror of the sidebar's Woke pill for the open thread. It uses the same
+  // visit comparison and change request settle rule.
   const activeThreadLastVisitedAt = useUiStateStore((store) =>
     activeThreadKey === null ? undefined : store.threadLastVisitedAtById[activeThreadKey],
   );
   const activeThreadWokeVisible = useMemo(() => {
     if (activeThreadWokeAt === null) return false;
-    if (activeThreadShell?.settledOverride === "settled") return false;
+    if (
+      changeRequestAutoSettles(activeThreadChangeRequest, {
+        autoSettleOnMerge,
+        thread: activeThreadShell,
+      })
+    ) {
+      return false;
+    }
     const wokeAtMs = Date.parse(activeThreadWokeAt);
     if (Number.isNaN(wokeAtMs)) return false;
     // Having the thread open counts as a visit at completedAt (the effect
@@ -5184,11 +5284,28 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     activeLatestTurn?.completedAt,
     activeThreadLastVisitedAt,
+    activeThreadChangeRequest,
     activeThreadShell,
     activeThreadWokeAt,
+    autoSettleOnMerge,
   ]);
-  const activeThreadSettled =
-    supportsSettlement && activeThreadShell?.settledOverride === "settled";
+  const activeThreadSettled = useMemo(() => {
+    if (activeThreadShell === null || !supportsSettlement) return false;
+    return effectiveSettled(activeThreadShell, {
+      now: `${nowMinute}:00.000Z`,
+      autoSettleAfterDays,
+      autoSettleOnMerge,
+      changeRequest: activeThreadChangeRequest,
+    });
+  }, [
+    activeThreadChangeRequest,
+    activeThreadShell,
+    autoSettleAfterDays,
+    autoSettleOnMerge,
+    changeRequestSnapshotByKey,
+    nowMinute,
+    supportsSettlement,
+  ]);
   const unsettleThreadMutation = useAtomCommand(threadEnvironment.unsettle, {
     reportFailure: false,
   });
@@ -5785,13 +5902,6 @@ export default function ChatView(props: ChatViewProps) {
       });
       if (!command) return;
 
-      if (command === "thread.copyReference") {
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) copyActiveThreadReference();
-        return;
-      }
-
       if (command === "thread.settle") {
         event.preventDefault();
         event.stopPropagation();
@@ -5972,7 +6082,6 @@ export default function ChatView(props: ChatViewProps) {
     supportsPinning,
     supportsSettlement,
     confirmAndUnpinThread,
-    copyActiveThreadReference,
     toggleRightPanel,
     toggleRightPanelMaximized,
     toggleTerminalVisibility,
@@ -5999,9 +6108,13 @@ export default function ChatView(props: ChatViewProps) {
   }, [activeThreadId, composerRef]);
 
   const onRevertToTurnCount = useCallback(
-    async (turnCount: number) => {
+    async (
+      turnCount: number,
+      scope: "thread" | "provenance-turn" = "thread",
+      preview = false,
+    ): Promise<boolean> => {
       const localApi = readLocalApi();
-      if (!localApi || !activeThread || isRevertingCheckpoint) return;
+      if (!localApi || !activeThread || isRevertingCheckpoint) return false;
 
       if (!supportsConversationRollback) {
         setThreadError(
@@ -6015,22 +6128,31 @@ export default function ChatView(props: ChatViewProps) {
           activeThread.id,
           `Reconnect ${activeEnvironmentUnavailableLabel} before reverting checkpoints.`,
         );
-        return;
+        return false;
       }
       if (phase === "running" || isSendBusy || isConnecting) {
         setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
-        return;
+        return false;
       }
-      const confirmed = await localApi.dialogs.confirm(
-        [
-          `Revert this thread to checkpoint ${turnCount}?`,
-          "This will discard newer messages and turn diffs in this thread.",
-          "This action cannot be undone.",
-        ].join("\n"),
-        { variant: "destructive" },
-      );
+      const isProvenanceUndo = scope === "provenance-turn";
+      const confirmed = preview
+        ? true
+        : await localApi.dialogs.confirm(
+            isProvenanceUndo
+              ? [
+                  `Undo workspace changes from turn ${turnCount}?`,
+                  "Conversation history and later non-overlapping workspace changes will be preserved.",
+                  "The undo stops if the recorded patch no longer applies cleanly.",
+                ].join("\n")
+              : [
+                  `Revert this thread to checkpoint ${turnCount}?`,
+                  "This will discard newer messages and turn diffs in this thread.",
+                  "This action cannot be undone.",
+                ].join("\n"),
+            { variant: "destructive" },
+          );
       if (!confirmed) {
-        return;
+        return false;
       }
 
       setIsRevertingCheckpoint(true);
@@ -6040,16 +6162,23 @@ export default function ChatView(props: ChatViewProps) {
         input: {
           threadId: activeThread.id,
           turnCount,
+          ...(scope === "provenance-turn" ? { scope } : {}),
+          ...(preview ? { preview: true } : {}),
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
         setThreadError(
           activeThread.id,
-          error instanceof Error ? error.message : "Failed to revert thread state.",
+          error instanceof Error
+            ? error.message
+            : isProvenanceUndo
+              ? "Failed to undo workspace changes."
+              : "Failed to revert thread state.",
         );
       }
       setIsRevertingCheckpoint(false);
+      return result._tag !== "Failure";
     },
     [
       activeThread,
@@ -6685,6 +6814,7 @@ export default function ChatView(props: ChatViewProps) {
                 : {}),
             }
           : undefined;
+      beginLocalDispatch({ preparingWorktree: false });
       const backgroundThreadRef =
         resolvedSubmissionIntent === "background"
           ? scopeThreadRef(activeThread.environmentId, threadIdForSend)
@@ -7489,6 +7619,23 @@ export default function ChatView(props: ChatViewProps) {
     },
     [activeThreadRef, isServerThread, onDiffPanelOpen],
   );
+  const onOpenConflictReview = useCallback(
+    (input: {
+      readonly filePath: string;
+      readonly lineRanges: ReadonlyArray<{ readonly start: number; readonly end: number }>;
+      readonly earlier: ConflictReviewTurn;
+      readonly current: ConflictReviewTurn;
+    }) => {
+      if (!isServerThread || !activeThreadRef) return;
+      useDiffPanelStore.getState().selectConflictReview(activeThreadRef, {
+        kind: "conflict",
+        ...input,
+      });
+      useRightPanelStore.getState().open(activeThreadRef, "diff");
+      onDiffPanelOpen?.();
+    },
+    [activeThreadRef, isServerThread, onDiffPanelOpen],
+  );
   // Both the Map and the revert handler are read from refs at call-time so
   // the callback reference is fully stable and never busts context identity.
   const revertTurnCountRef = useRef(revertTurnCountByUserMessageId);
@@ -7595,6 +7742,7 @@ export default function ChatView(props: ChatViewProps) {
           composerDraftTarget={composerDraftTarget}
           initialGitScope={initialDiffPanelGitScope}
           workspaceMutationId={workspaceMutationId}
+          onRevealConversationMessage={revealConversationMessage}
         />
       </Suspense>
     ) : renderedRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
@@ -7645,6 +7793,26 @@ export default function ChatView(props: ChatViewProps) {
         model={agentPanelModel}
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
+      />
+    ) : renderedRightPanelSurface?.kind === "history" ? (
+      <SafeHistoryPanel
+        alertsHidden={provenanceAlertsHidden}
+        activities={threadActivities}
+        assistantMessageIdByTurnId={assistantMessageIdByTurnId}
+        userRequestByTurnId={userRequestByTurnId}
+        onInspect={onOpenTurnDiff}
+        onRevealConversation={revealConversationMessage}
+        onPreviewUndo={(turnCount) => onRevertToTurnCount(turnCount, "provenance-turn", true)}
+        onAlertsHiddenChange={setProvenanceAlertsHidden}
+        onUndoTurn={(turnCount) => onRevertToTurnCount(turnCount, "provenance-turn")}
+      />
+    ) : renderedRightPanelSurface?.kind === "integration" && activeThread ? (
+      <SafeIntegrationPanel
+        environmentId={activeThread.environmentId}
+        projectId={activeThread.projectId}
+        activeThreadId={activeThread.id}
+        activeActivities={threadActivities}
+        onCompare={onOpenConflictReview}
       />
     ) : (renderedRightPanelSurface?.kind === "files" ||
         renderedRightPanelSurface?.kind === "file") &&
@@ -7732,6 +7900,7 @@ export default function ChatView(props: ChatViewProps) {
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
             activeThreadTitle={activeThread.title}
             isServerThread={isServerThread}
+            changeRequest={activeThreadChangeRequest}
             activeProjectName={activeProject?.title}
             activeProjectCwd={activeProject?.workspaceRoot ?? null}
             activeProjectFaviconPath={activeProject?.faviconPath ?? null}
@@ -7843,6 +8012,8 @@ export default function ChatView(props: ChatViewProps) {
                 onContentOverflowChange={setTimelineOverflows}
                 onToolOutputCollapsedAtEnd={onToolOutputCollapsedAtEnd}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                revealMessageRequest={conversationRevealRequest}
+                onRevealMessageResult={handleConversationRevealResult}
                 hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
                 topFadeEnabled={!hasTimelineTopBanner}
                 loadEarlier={loadEarlierTurns}
@@ -7900,7 +8071,6 @@ export default function ChatView(props: ChatViewProps) {
                         }
                       >
                         <DraftHeroHeadline
-                          draftId={draftId}
                           activeProjectRef={activeProjectRef}
                           activeProjectTitle={activeProject?.title ?? null}
                         />
@@ -7915,6 +8085,47 @@ export default function ChatView(props: ChatViewProps) {
                         : undefined
                     }
                   >
+                    {/* Safety notices are anchored to the composer. Only the
+                        foremost notice is interactive; pending notices queue behind it. */}
+                    <div className="provenance-alert-stack" data-chat-composer-alert-queue="true">
+                      <ProviderStatusBanner
+                        status={visibleProviderStatus}
+                        onDismiss={() =>
+                          setDismissedProviderStatusBannerKey(providerStatusBannerKey)
+                        }
+                      />
+                      {!provenanceAlertsHidden ? (
+                        <>
+                          <ProvenanceOverlapBanner
+                            key={`provenance-overlap-${activeThread.id}`}
+                            activities={threadActivities}
+                            onCompare={onOpenConflictReview}
+                            onDisableAlerts={() => setProvenanceAlertsHidden(true)}
+                            onInspect={onOpenTurnDiff}
+                          />
+                          <SafeUndoFailureAlert
+                            activities={threadActivities}
+                            onDisableAlerts={() => setProvenanceAlertsHidden(true)}
+                            onInspect={onOpenTurnDiff}
+                            onOpenHistory={addHistorySurface}
+                          />
+                          <ProvenanceTurnReviewCard
+                            key={`provenance-history-${activeThread.id}`}
+                            activities={threadActivities}
+                            onDisableAlerts={() => setProvenanceAlertsHidden(true)}
+                            onInspect={onOpenTurnDiff}
+                            onOpenHistory={addHistorySurface}
+                            onPreviewUndo={(turnCount) =>
+                              onRevertToTurnCount(turnCount, "provenance-turn", true)
+                            }
+                            onUndoTurn={(turnCount) =>
+                              onRevertToTurnCount(turnCount, "provenance-turn")
+                            }
+                            userRequestByTurnId={userRequestByTurnId}
+                          />
+                        </>
+                      ) : null}
+                    </div>
                     <ComposerSurface.Shell contextStrip={showComposerContextStrip}>
                       <ComposerSurface.Host>
                         <div ref={attachDraftHeroComposerAnchorRef} className="relative z-10">
@@ -8181,12 +8392,20 @@ export default function ChatView(props: ChatViewProps) {
           onAddFiles={addFilesSurface}
           onAddPullRequest={addPullRequestSurface}
           onAddAgents={addAgentsSurface}
+          onAddHistory={addHistorySurface}
+          onAddIntegration={addIntegrationSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
           terminalAvailable={activeProject !== null}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
           pullRequestAvailable={pullRequestSurfaceAvailable}
           agentsAvailable
+          historyAvailable={threadActivities.some(
+            (activity) => activity.kind === "provenance.turn.completed",
+          )}
+          integrationAvailable={threadActivities.some(
+            (activity) => activity.kind === "provenance.turn.completed",
+          )}
           liveAgentCount={agentPanelModel.liveCount}
         >
           {rightPanelContent}
@@ -8231,12 +8450,20 @@ export default function ChatView(props: ChatViewProps) {
             onAddFiles={addFilesSurface}
             onAddPullRequest={addPullRequestSurface}
             onAddAgents={addAgentsSurface}
+            onAddHistory={addHistorySurface}
+            onAddIntegration={addIntegrationSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
             terminalAvailable={activeProject !== null}
             diffAvailable={isServerThread && isGitRepo}
             filesAvailable={activeProject !== null}
             pullRequestAvailable={pullRequestSurfaceAvailable}
             agentsAvailable
+            historyAvailable={threadActivities.some(
+              (activity) => activity.kind === "provenance.turn.completed",
+            )}
+            integrationAvailable={threadActivities.some(
+              (activity) => activity.kind === "provenance.turn.completed",
+            )}
             liveAgentCount={agentPanelModel.liveCount}
           >
             {rightPanelContent}

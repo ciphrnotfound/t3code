@@ -14,7 +14,9 @@ import {
   FileDiff,
   Files,
   GitPullRequest,
+  GitMerge,
   Globe2,
+  History,
   Plus,
   TerminalSquare,
   Volume2,
@@ -105,6 +107,8 @@ interface RightPanelTabsProps {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddHistory?: () => void;
+  onAddIntegration?: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -112,6 +116,8 @@ interface RightPanelTabsProps {
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
+  historyAvailable?: boolean;
+  integrationAvailable?: boolean;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
   children: ReactNode;
@@ -140,6 +146,8 @@ const SURFACE_DISABLED_REASONS = {
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
   agents: "Agents are only available from a thread.",
+  history: "Provenance is only available after a task changes files.",
+  integration: "Integration Check requires attributed project worktrees.",
 } as const;
 
 /** Overlays that must win over the launcher's letter shortcuts. */
@@ -162,7 +170,11 @@ const SURFACE_UNAVAILABLE_HINTS = {
   diff: "Available for Git repositories.",
   pullRequest: "No pull request on this branch yet.",
   agents: "Available from a thread.",
+  history: "Available after a thread changes files.",
+  integration: "Available after this task changes files.",
 } as const;
+const NOOP_ADD_HISTORY = () => {};
+const NOOP_ADD_INTEGRATION = () => {};
 
 type TabContextMenuAction =
   | "copy-path"
@@ -299,12 +311,16 @@ function RightPanelEmptyState(props: {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddHistory: () => void;
+  onAddIntegration: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
+  historyAvailable: boolean;
+  integrationAvailable: boolean;
   liveAgentCount: number;
 }) {
   // -1 means no highlight: it only appears on hover or arrow use.
@@ -359,6 +375,26 @@ function RightPanelEmptyState(props: {
       available: props.pullRequestAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequest,
       onClick: props.onAddPullRequest,
+      badgeCount: 0,
+    },
+    {
+      label: "Provenance",
+      description: "Trace and safely undo task changes.",
+      icon: History,
+      shortcut: "H",
+      available: props.historyAvailable ?? false,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.history,
+      onClick: props.onAddHistory ?? NOOP_ADD_HISTORY,
+      badgeCount: 0,
+    },
+    {
+      label: "Integration Check",
+      description: "Check attributed changes before integration.",
+      icon: GitMerge,
+      shortcut: "I",
+      available: props.integrationAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.integration,
+      onClick: props.onAddIntegration,
       badgeCount: 0,
     },
     {
@@ -604,6 +640,10 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "agents":
       return "Agents";
+    case "history":
+      return "Provenance";
+    case "integration":
+      return "Integration Check";
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -685,6 +725,10 @@ function SurfaceIcon({
       );
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "history":
+      return <History className="size-3 shrink-0" />;
+    case "integration":
+      return <GitMerge className="size-3 shrink-0" />;
   }
 }
 
@@ -805,6 +849,22 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       available: props.pullRequestAvailable,
       disabledReason: SURFACE_DISABLED_REASONS.pullRequest,
       onClick: props.onAddPullRequest,
+    },
+    {
+      label: "Provenance",
+      icon: History,
+      shortcut: "H",
+      available: props.historyAvailable ?? false,
+      disabledReason: SURFACE_DISABLED_REASONS.history,
+      onClick: props.onAddHistory ?? NOOP_ADD_HISTORY,
+    },
+    {
+      label: "Integration Check",
+      icon: GitMerge,
+      shortcut: "I",
+      available: props.integrationAvailable ?? false,
+      disabledReason: SURFACE_DISABLED_REASONS.integration,
+      onClick: props.onAddIntegration ?? NOOP_ADD_INTEGRATION,
     },
     {
       label: "Agents",
@@ -1250,13 +1310,17 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddDiff={props.onAddDiff}
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
-            onAddAgents={props.onAddAgents}
+          onAddAgents={props.onAddAgents}
+          onAddHistory={props.onAddHistory ?? NOOP_ADD_HISTORY}
+          onAddIntegration={props.onAddIntegration ?? NOOP_ADD_INTEGRATION}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}
-            agentsAvailable={props.agentsAvailable}
+          agentsAvailable={props.agentsAvailable}
+          historyAvailable={props.historyAvailable ?? false}
+          integrationAvailable={props.integrationAvailable ?? false}
             liveAgentCount={props.liveAgentCount}
           />
         ) : (

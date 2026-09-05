@@ -8,6 +8,8 @@ import type {
 } from "@pierre/diffs";
 import type { CodeViewHandle } from "@pierre/diffs/react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { ProvenanceFileRange } from "@t3tools/client-runtime/state/provenance";
+import { MessageSquareTextIcon, ShieldCheckIcon } from "lucide-react";
 import { useCallback, useMemo, useState, type ReactNode, type Ref } from "react";
 
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
@@ -19,15 +21,17 @@ import {
 } from "~/reviewCommentContext";
 
 import { nextFileCommentId } from "../files/fileCommentAnnotations";
+import { Button } from "../ui/button";
 import { DiffCommentAnnotation } from "./DiffCommentAnnotation";
 import { StyledDiffCodeView, type StyledDiffCodeViewOptions } from "./StyledDiffCodeView";
 
 interface DiffCommentAnnotationEntry {
   id: string;
-  kind: "draft" | "comment";
+  kind: "draft" | "comment" | "ownership";
   range: SelectedLineRange;
   rangeLabel: string;
   text: string;
+  onRevealConversation?: () => void;
 }
 
 interface DiffCommentAnnotationGroup {
@@ -37,6 +41,12 @@ interface DiffCommentAnnotationGroup {
 type DiffCommentLineAnnotation = DiffLineAnnotation<DiffCommentAnnotationGroup>;
 export type AnnotatableCodeViewHandle = CodeViewHandle<DiffCommentAnnotationGroup>;
 const EMPTY_REVIEW_COMMENTS: ReadonlyArray<ReviewCommentContext> = [];
+const EMPTY_PROVENANCE_OWNERSHIP: ReadonlyArray<{
+  readonly filePath: string;
+  readonly lineRanges: ReadonlyArray<ProvenanceFileRange>;
+  readonly label: string;
+  readonly onRevealConversation?: () => void;
+}> = [];
 
 function annotationSide(range: SelectedLineRange): AnnotationSide {
   return (range.endSide ?? range.side) === "deletions" ? "deletions" : "additions";
@@ -87,6 +97,12 @@ interface AnnotatableCodeViewProps {
   viewerRef?: Ref<AnnotatableCodeViewHandle>;
   className?: string;
   renderHeaderFilenameSuffix: (fileDiff: FileDiffMetadata) => ReactNode;
+  ownership?: ReadonlyArray<{
+    readonly filePath: string;
+    readonly lineRanges: ReadonlyArray<ProvenanceFileRange>;
+    readonly label: string;
+    readonly onRevealConversation?: () => void;
+  }>;
   renderHeaderPrefix: (
     fileDiff: FileDiffMetadata,
     fileKey: string,
@@ -109,6 +125,7 @@ export function AnnotatableCodeView({
   className,
   renderHeaderFilenameSuffix,
   renderHeaderPrefix,
+  ownership = EMPTY_PROVENANCE_OWNERSHIP,
 }: AnnotatableCodeViewProps) {
   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
@@ -147,8 +164,40 @@ export function AnnotatableCodeView({
               text: comment.text,
             });
           }, []);
-        const annotations =
-          draft?.fileKey === fileKey ? [...persisted, draft.annotation] : persisted;
+        const ownershipAnnotations = ownership
+          .filter((entry) => entry.filePath === filePath)
+          .flatMap((entry) =>
+            entry.lineRanges.map<DiffCommentLineAnnotation>((range, index) => ({
+              side: "additions",
+              lineNumber: range.end,
+              metadata: {
+                entries: [
+                  {
+                    id: `provenance-owner:${filePath}:${range.start}:${range.end}:${index}`,
+                    kind: "ownership",
+                    range: {
+                      side: "additions",
+                      start: range.start,
+                      end: range.end,
+                    },
+                    rangeLabel:
+                      range.start === range.end
+                        ? `Line ${range.start}`
+                        : `Lines ${range.start}–${range.end}`,
+                    text: entry.label,
+                    ...(entry.onRevealConversation
+                      ? { onRevealConversation: entry.onRevealConversation }
+                      : {}),
+                  },
+                ],
+              },
+            })),
+          );
+        const annotations = [
+          ...persisted,
+          ...ownershipAnnotations,
+          ...(draft?.fileKey === fileKey ? [draft.annotation] : []),
+        ];
         return {
           id: fileKey,
           type: "diff",
@@ -166,7 +215,7 @@ export function AnnotatableCodeView({
           ),
         };
       }),
-    [draft, files, reviewComments, sectionId],
+    [draft, files, ownership, reviewComments, sectionId],
   );
 
   const removeEntry = useCallback(
@@ -268,18 +317,43 @@ export function AnnotatableCodeView({
           <div
             className={hasDraft ? "py-1" : "divide-y divide-border/30 border-y border-border/30"}
           >
-            {annotation.metadata.entries.map((entry) => (
-              <DiffCommentAnnotation
-                key={entry.id}
-                kind={entry.kind}
-                rangeLabel={entry.rangeLabel}
-                text={entry.kind === "draft" ? draftText : entry.text}
-                onTextChange={setDraftText}
-                onCancel={() => removeEntry(entry.id)}
-                onComment={(text) => submitEntry(entry.id, text)}
-                onDelete={() => removeEntry(entry.id)}
-              />
-            ))}
+            {annotation.metadata.entries.map((entry) =>
+              entry.kind === "ownership" ? (
+                <div
+                  className="flex min-w-0 items-center gap-2 border-s-2 border-info/45 bg-info/[0.035] px-2.5 py-1.5 text-[11px] text-muted-foreground"
+                  key={entry.id}
+                >
+                  <ShieldCheckIcon className="size-3.5 shrink-0 text-info" aria-hidden="true" />
+                  <span className="shrink-0 font-medium text-foreground/80">Agent Blame</span>
+                  <span className="min-w-0 truncate">{entry.text}</span>
+                  <span className="ml-auto shrink-0 font-mono text-[10px]">
+                    {entry.rangeLabel}
+                  </span>
+                  {entry.onRevealConversation ? (
+                    <Button
+                      aria-label={`Open conversation for ${entry.rangeLabel}`}
+                      className="shrink-0"
+                      onClick={entry.onRevealConversation}
+                      size="icon-xs"
+                      variant="ghost"
+                    >
+                      <MessageSquareTextIcon aria-hidden="true" />
+                    </Button>
+                  ) : null}
+                </div>
+              ) : (
+                <DiffCommentAnnotation
+                  key={entry.id}
+                  kind={entry.kind}
+                  rangeLabel={entry.rangeLabel}
+                  text={entry.kind === "draft" ? draftText : entry.text}
+                  onTextChange={setDraftText}
+                  onCancel={() => removeEntry(entry.id)}
+                  onComment={(text) => submitEntry(entry.id, text)}
+                  onDelete={() => removeEntry(entry.id)}
+                />
+              ),
+            )}
           </div>
         );
       }}
