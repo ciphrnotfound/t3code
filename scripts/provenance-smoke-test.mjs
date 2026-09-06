@@ -2,6 +2,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import { undoApplyArgs, undoDiffArgs } from "../apps/server/src/provenance/UndoPatch.ts";
 
 const repo = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provenance-smoke-"));
 const git = (args, input) =>
@@ -79,20 +80,11 @@ export function canAccessWorkspace(role: "admin" | "member", isSuspended: boolea
 }
 `,
   );
-  const reversePatch = git([
-    "diff",
-    "--patch",
-    "--unified=0",
-    "--no-color",
-    "--no-ext-diff",
-    "--no-textconv",
-    before.trim(),
-    after.trim(),
-  ]);
+  const reversePatch = git(undoDiffArgs(before.trim(), after.trim()));
   if (!reversePatch.includes("agent A") || !reversePatch.includes("secondary from agent A"))
     throw new Error("smoke fixture did not produce the expected patch");
-  git(["apply", "--reverse", "--check", "--unidiff-zero", "--whitespace=nowarn"], reversePatch);
-  git(["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn"], reversePatch);
+  git(undoApplyArgs(true), reversePatch);
+  git(undoApplyArgs(), reversePatch);
 
   const shared = NodeFS.readFileSync(NodePath.join(repo, "shared.txt"), "utf8").replaceAll(
     "\r\n",
@@ -124,14 +116,14 @@ export function canAccessWorkspace(role: "admin" | "member", isSuspended: boolea
   NodeFS.writeFileSync(NodePath.join(repo, "secondary.txt"), "secondary from agent A\n");
   let conflictRefused = false;
   try {
-    git(["apply", "--reverse", "--check", "--unidiff-zero", "--whitespace=nowarn"], reversePatch);
+    git(undoApplyArgs(true), reversePatch);
   } catch {
     conflictRefused = true;
   }
   if (!conflictRefused) throw new Error("conflicting later edit was not refused");
   let atomicApplyRefused = false;
   try {
-    git(["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn"], reversePatch);
+    git(undoApplyArgs(), reversePatch);
   } catch {
     atomicApplyRefused = true;
   }

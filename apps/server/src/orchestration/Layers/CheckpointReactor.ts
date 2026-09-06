@@ -50,6 +50,7 @@ import { readPersistedProvenanceHistory } from "../../provenance/PersistedHistor
 import { summarizeProvenanceTurn } from "../../provenance/TurnSummary.ts";
 import { shouldAppendRevertFailure } from "../../provenance/FailureDedup.ts";
 import { isProvenanceEnabled, worktreeMismatch } from "../../provenance/config.ts";
+import { undoApplyArgs, undoDiffArgs } from "../../provenance/UndoPatch.ts";
 import { VcsDriverRegistry } from "../../vcs/VcsDriverRegistry.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -1003,24 +1004,13 @@ const make = Effect.gen(function* () {
         event.payload.turnCount,
       );
       const vcsDriver = yield* vcsDriverRegistry.get("git");
-      // A normal unified diff carries three context lines. If a later turn
-      // changes one of those nearby lines, Git rejects a reversal even when
-      // the target turn's actual edits are independent. A zero-context patch
-      // contains only the target mutation; git apply still performs its own
-      // all-or-nothing workspace check before we mutate anything.
+      // Keep context even when a nearby later edit forces manual review.
+      // Zero-context reversal can insert deleted lines at stale offsets or
+      // match an unrelated identical statement elsewhere in the file.
       const reversePatchResult = yield* vcsDriver.execute({
         operation: "provenance.safeUndo.diff",
         cwd: checkpointCwd,
-        args: [
-          "diff",
-          "--patch",
-          "--unified=0",
-          "--no-color",
-          "--no-ext-diff",
-          "--no-textconv",
-          `${beforeCheckpointRef}^{commit}`,
-          `${targetCheckpointRef}^{commit}`,
-        ],
+        args: undoDiffArgs(beforeCheckpointRef, targetCheckpointRef),
         allowNonZeroExit: true,
       });
       const reversePatch =
@@ -1055,7 +1045,7 @@ const make = Effect.gen(function* () {
       const applicability = yield* vcsDriver.execute({
         operation: "provenance.safeUndo.check",
         cwd: checkpointCwd,
-        args: ["apply", "--reverse", "--check", "--unidiff-zero", "--whitespace=nowarn"],
+        args: undoApplyArgs(true),
         stdin: reversePatch,
         allowNonZeroExit: true,
       });
@@ -1098,7 +1088,7 @@ const make = Effect.gen(function* () {
         // Apply the exact operation that passed the safety check above. Using
         // --3way here makes Git consult the index and can fail even when the
         // checked reverse patch applies cleanly to the working tree.
-        args: ["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn"],
+        args: undoApplyArgs(),
         stdin: reversePatch,
         allowNonZeroExit: true,
       });

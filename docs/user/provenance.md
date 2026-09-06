@@ -15,9 +15,11 @@ checkpoint changes, not live conflicts or proof that two changes are compatible.
 Preview a turn's undo before applying it. Preview checks the current files
 without changing them. Undo checks again when you apply it, because another
 edit may have arrived since the preview. A successful undo removes that turn's
-patch while preserving compatible later edits and the conversation history.
-If any file conflicts, the operation leaves every file in the patch unchanged.
-Binary changes and renames require manual review.
+context-anchored patch while preserving compatible later edits and the
+conversation history. Nearby later edits may require manual review even when
+they do not touch the same lines. If any file conflicts, the operation leaves
+every file in the patch unchanged. Binary changes and renames require manual
+review.
 
 Line ranges describe the recorded diffs; later insertions and deletions can
 move code. Review the actual patch and the workspace check rather than treating
