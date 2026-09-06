@@ -276,8 +276,6 @@ interface DiffPanelProps {
   onRevealConversationMessage?: (messageId: MessageId) => void;
 }
 
-export { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
-
 export default function DiffPanel({
   mode = "inline",
   composerDraftTarget,
