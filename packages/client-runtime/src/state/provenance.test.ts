@@ -44,7 +44,7 @@ function changeSet(overrides: Partial<ProvenanceTurnChangeSet> = {}): Provenance
 }
 
 describe("findProvenanceLineOwner", () => {
-  it("returns the newest exact owner and supports file-only fallback", () => {
+  it("returns the newest recorded range and supports file-only fallback", () => {
     const older = mutation({
       path: "src/app.ts",
       completedAt: "2026-01-01T00:00:00.000Z",
@@ -57,7 +57,7 @@ describe("findProvenanceLineOwner", () => {
     });
     expect(findProvenanceLineOwner([older, newer], "src/app.ts", 16)).toEqual({
       mutation: newer,
-      confidence: "exact",
+      confidence: "recorded-range",
     });
     expect(findProvenanceLineOwner([older, newer], "src/app.ts", 30)).toBeUndefined();
     expect(

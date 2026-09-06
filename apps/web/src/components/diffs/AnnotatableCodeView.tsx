@@ -324,7 +324,7 @@ export function AnnotatableCodeView({
                   key={entry.id}
                 >
                   <ShieldCheckIcon className="size-3.5 shrink-0 text-info" aria-hidden="true" />
-                  <span className="shrink-0 font-medium text-foreground/80">Agent Blame</span>
+                  <span className="shrink-0 font-medium text-foreground/80">Turn provenance</span>
                   <span className="min-w-0 truncate">{entry.text}</span>
                   <span className="ml-auto shrink-0 font-mono text-[10px]">
                     {entry.rangeLabel}

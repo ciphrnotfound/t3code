@@ -236,9 +236,9 @@ const make = Effect.gen(function* () {
     if (hydratedProvenanceWorkspaces.has(workspaceKey)) {
       return provenanceHistory.get(workspaceKey) ?? [];
     }
-    const activities = projectionSnapshotQuery.getProvenanceActivities
-      ? yield* projectionSnapshotQuery.getProvenanceActivities()
-      : (yield* projectionSnapshotQuery.getSnapshot()).threads.flatMap((thread) => thread.activities);
+    const activities = (yield* projectionSnapshotQuery.getSnapshot()).threads.flatMap(
+      (thread) => thread.activities,
+    );
     const history = [...readPersistedProvenanceHistory([{ activities }], workspaceKey)];
     provenanceHistory.set(workspaceKey, history);
     hydratedProvenanceWorkspaces.add(workspaceKey);

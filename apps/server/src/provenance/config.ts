@@ -1,7 +1,7 @@
 export function isProvenanceEnabled(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  return environment.T3_PROVENANCE_ENABLED !== "0";
+  return environment.T3_PROVENANCE_ENABLED === "1";
 }
 
 /** Canonicalizes workspace paths without requiring the path to exist. */

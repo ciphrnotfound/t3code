@@ -123,10 +123,15 @@ export function describeProvenanceTurnScope(
 
 export type ProvenanceLineOwner = {
   readonly mutation: ProvenanceFileMutation;
-  readonly confidence: "exact" | "file-only";
+  /**
+   * Ranges are captured from a completed checkpoint diff. They are useful
+   * provenance evidence, but later edits can move a live line without a
+   * content anchor, so they must never be presented as exact live blame.
+   */
+  readonly confidence: "recorded-range" | "file-only";
 };
 
-/** Finds the most recent recorded turn that owns a line in a file. */
+/** Finds the most recent turn recorded for this checkpoint-diff line range. */
 export function findProvenanceLineOwner(
   mutations: ReadonlyArray<ProvenanceFileMutation>,
   path: string,
@@ -138,7 +143,7 @@ export function findProvenanceLineOwner(
   const exact = candidates.find((mutation) =>
     mutation.lineRanges?.some((range) => range.start <= line && line <= range.end),
   );
-  if (exact) return { mutation: exact, confidence: "exact" };
+  if (exact) return { mutation: exact, confidence: "recorded-range" };
   const fileOnly = candidates.find((mutation) => !mutation.lineRanges?.length);
   return fileOnly ? { mutation: fileOnly, confidence: "file-only" } : undefined;
 }

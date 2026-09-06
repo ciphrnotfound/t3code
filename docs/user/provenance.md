@@ -1,5 +1,8 @@
 # Review and undo agent changes
 
+Provenance is currently an opt-in rollout. Start T3 with
+`T3_PROVENANCE_ENABLED=1` to enable recording and recovery controls.
+
 In web and desktop, open **Provenance** from the right panel to inspect recorded
 file-changing turns. Open a turn's diff to review the changes or jump to the
 assistant response that produced them. You can also export the turn as a patch.

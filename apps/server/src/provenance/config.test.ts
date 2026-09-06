@@ -8,11 +8,11 @@ import {
 } from "./config.ts";
 
 describe("isProvenanceEnabled", () => {
-  it("defaults to enabled", () => {
-    expect(isProvenanceEnabled({})).toBe(true);
+  it("defaults to disabled so provenance can be rolled out safely", () => {
+    expect(isProvenanceEnabled({})).toBe(false);
   });
 
-  it("supports an explicit operator disable switch", () => {
+  it("requires an explicit operator enable switch", () => {
     expect(isProvenanceEnabled({ T3_PROVENANCE_ENABLED: "0" })).toBe(false);
     expect(isProvenanceEnabled({ T3_PROVENANCE_ENABLED: "1" })).toBe(true);
   });
