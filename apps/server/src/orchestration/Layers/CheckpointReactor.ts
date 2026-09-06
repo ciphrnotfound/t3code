@@ -25,6 +25,7 @@ import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 import {
   classifyTurnDiffFileOperations,
   parseTurnDiffFileRanges,
+  parseTurnDiffFilesFromNumstat,
   parseTurnDiffFilesFromUnifiedDiff,
   parseTurnDiffRenameSources,
   parseTurnDiffUnsupportedPaths,
@@ -331,67 +332,77 @@ const make = Effect.gen(function* () {
     yield* workspaceEntries.refresh(input.cwd);
 
     const { files, operationByPath, rangesByPath, renameSourceByPath, unsupportedPaths } =
-      yield* checkpointStore
-        .diffCheckpoints({
+      yield* Effect.all({
+        diff: checkpointStore.diffCheckpoints({
           cwd: input.cwd,
           fromCheckpointRef,
           toCheckpointRef: targetCheckpointRef,
           fallbackFromToHead: false,
           ignoreWhitespace: false,
-        })
-        .pipe(
-          Effect.map((diff) => {
-            const operationByPath = classifyTurnDiffFileOperations(diff);
-            const rangesByPath = parseTurnDiffFileRanges(diff);
-            const renameSourceByPath = parseTurnDiffRenameSources(diff);
-            const parsedFiles = parseTurnDiffFilesFromUnifiedDiff(diff);
-            const unsupportedPaths = parseTurnDiffUnsupportedPaths(diff);
-            return {
-              files: [
-                ...parsedFiles.map((file) => ({
-                  path: file.path,
-                  kind: "modified" as const,
-                  additions: file.additions,
-                  deletions: file.deletions,
-                })),
-                ...unsupportedPaths
-                  .filter((path) => !parsedFiles.some((file) => file.path === path))
-                  .map((path) => ({ path, kind: "modified" as const, additions: 0, deletions: 0 })),
-              ],
-              operationByPath,
-              rangesByPath,
-              renameSourceByPath,
-              unsupportedPaths,
-            };
+        }),
+        numstat: checkpointStore.diffCheckpoints({
+          cwd: input.cwd,
+          fromCheckpointRef,
+          toCheckpointRef: targetCheckpointRef,
+          fallbackFromToHead: false,
+          ignoreWhitespace: false,
+          format: "numstat",
+        }),
+      }).pipe(
+        Effect.map(({ diff, numstat }) => {
+          const operationByPath = classifyTurnDiffFileOperations(diff);
+          const rangesByPath = parseTurnDiffFileRanges(diff);
+          const renameSourceByPath = parseTurnDiffRenameSources(diff);
+          // Full patches are intentionally display-truncated. Numstat remains
+          // compact, so use it for exact counts even on very large turns.
+          const parsedFiles = parseTurnDiffFilesFromNumstat(numstat);
+          const unsupportedPaths = parseTurnDiffUnsupportedPaths(diff);
+          return {
+            files: [
+              ...parsedFiles.map((file) => ({
+                path: file.path,
+                kind: "modified" as const,
+                additions: file.additions,
+                deletions: file.deletions,
+              })),
+              ...unsupportedPaths
+                .filter((path) => !parsedFiles.some((file) => file.path === path))
+                .map((path) => ({ path, kind: "modified" as const, additions: 0, deletions: 0 })),
+            ],
+            operationByPath,
+            rangesByPath,
+            renameSourceByPath,
+            unsupportedPaths,
+          };
+        }),
+        Effect.tapError((error) =>
+          appendCaptureFailureActivity({
+            threadId: input.threadId,
+            turnId: input.turnId,
+            detail: `Checkpoint captured, but turn diff summary is unavailable: ${error.message}`,
+            createdAt: input.createdAt,
           }),
-          Effect.tapError((error) =>
-            appendCaptureFailureActivity({
-              threadId: input.threadId,
-              turnId: input.turnId,
-              detail: `Checkpoint captured, but turn diff summary is unavailable: ${error.message}`,
-              createdAt: input.createdAt,
+        ),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to derive checkpoint file summary", {
+            threadId: input.threadId,
+            turnId: input.turnId,
+            turnCount: input.turnCount,
+            detail: error.message,
+          }).pipe(
+            Effect.as({
+              files: [],
+              operationByPath: new Map<string, string>(),
+              rangesByPath: new Map<
+                string,
+                ReadonlyArray<{ readonly start: number; readonly end: number }>
+              >(),
+              renameSourceByPath: new Map<string, string>(),
+              unsupportedPaths: [] as ReadonlyArray<string>,
             }),
           ),
-          Effect.catch((error) =>
-            Effect.logWarning("failed to derive checkpoint file summary", {
-              threadId: input.threadId,
-              turnId: input.turnId,
-              turnCount: input.turnCount,
-              detail: error.message,
-            }).pipe(
-              Effect.as({
-                files: [],
-                operationByPath: new Map<string, string>(),
-                rangesByPath: new Map<
-                  string,
-                  ReadonlyArray<{ readonly start: number; readonly end: number }>
-                >(),
-                renameSourceByPath: new Map<string, string>(),
-                unsupportedPaths: [] as ReadonlyArray<string>,
-              }),
-            ),
-          ),
-        );
+        ),
+      );
 
     const currentMutations: Array<ProvenanceMutation> = files.map((file) => {
       const lineRanges = rangesByPath.get(file.path);
