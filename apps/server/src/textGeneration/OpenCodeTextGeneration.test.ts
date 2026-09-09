@@ -165,7 +165,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
         },
         status: async () => {
           runtimeMock.state.statusCalls += 1;
-          return { data: {} };
+          return { data: { [`${baseUrl}/session`]: { type: "idle" } } };
         },
       },
     }) as unknown as ReturnType<OpenCodeRuntime.OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
