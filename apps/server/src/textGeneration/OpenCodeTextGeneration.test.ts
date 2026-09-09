@@ -26,8 +26,10 @@ const runtimeMock = {
     sessionCreateCalls: 0,
     promptAsyncCalls: 0,
     messagesCalls: 0,
+    statusCalls: 0,
     emptyMessageResponses: 0,
     alwaysEmptyMessages: false,
+    assistantCompleted: true,
     connectionError: undefined as Error | undefined,
     sessionCreateError: undefined as unknown,
     sessionResult: undefined as { data?: { id: string } } | undefined,
@@ -45,8 +47,10 @@ const runtimeMock = {
     this.state.sessionCreateCalls = 0;
     this.state.promptAsyncCalls = 0;
     this.state.messagesCalls = 0;
+    this.state.statusCalls = 0;
     this.state.emptyMessageResponses = 0;
     this.state.alwaysEmptyMessages = false;
+    this.state.assistantCompleted = true;
     this.state.connectionError = undefined;
     this.state.sessionCreateError = undefined;
     this.state.sessionResult = undefined;
@@ -149,7 +153,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
               {
                 info: {
                   role: "assistant",
-                  time: { completed: 1 },
+                  ...(runtimeMock.state.assistantCompleted ? { time: { completed: 1 } } : {}),
                   ...(result.data?.info?.error !== undefined
                     ? { error: result.data.info.error }
                     : {}),
@@ -159,7 +163,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
             ],
           };
         },
-        status: async () => ({ data: {} }),
+        status: async () => {
+          runtimeMock.state.statusCalls += 1;
+          return { data: {} };
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntime.OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -344,6 +351,24 @@ it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGeneration", (it) => {
         });
       }),
     ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("accepts an unfinished assistant after two idle status polls", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.assistantCompleted = false;
+
+        const generated = yield* textGeneration
+          .generateCommitMessage(DEFAULT_COMMIT_MESSAGE_INPUT);
+
+        expect(runtimeMock.state.messagesCalls).toBe(2);
+        expect(runtimeMock.state.statusCalls).toBe(2);
+        expect(generated).toEqual({
+          subject: "Improve OpenCode reuse",
+          body: "Reuse one server for the full action.",
+        });
+      }),
+    ),
   );
 
   it.effect("returns an empty-output error when no assistant message arrives", () =>
