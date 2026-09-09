@@ -32,6 +32,7 @@ export function SafeHistoryPanel({
   onAlertsHiddenChange,
   onRevealConversation,
   onPreviewUndo,
+  onRestoreTurn,
   onUndoTurn,
 }: {
   alertsHidden: boolean;
@@ -42,6 +43,7 @@ export function SafeHistoryPanel({
   onAlertsHiddenChange: (hidden: boolean) => void;
   onRevealConversation: (messageId: MessageId) => void;
   onPreviewUndo: (turnCount: number) => boolean | void | Promise<boolean | void>;
+  onRestoreTurn: (turnCount: number) => void;
   onUndoTurn: (turnCount: number) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -332,6 +334,18 @@ export function SafeHistoryPanel({
                       onClick={() => onInspect(changeSet.turnId, firstPath)}
                     >
                       Review
+                    </Button>
+                  ) : null}
+                  {changeSet.status === "reverted" &&
+                  checkpointTurnCount !== undefined &&
+                  changeSet.undoReceipt?.recoveryWorkspaceRef &&
+                  changeSet.undoReceipt.recoveryIndexRef ? (
+                    <Button
+                      size="xs"
+                      variant="secondary"
+                      onClick={() => onRestoreTurn(checkpointTurnCount)}
+                    >
+                      Restore pre-undo state
                     </Button>
                   ) : null}
                 </div>

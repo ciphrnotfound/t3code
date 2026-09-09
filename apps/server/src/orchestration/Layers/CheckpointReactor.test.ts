@@ -161,13 +161,15 @@ async function waitForThread(
       readonly id: ThreadId;
       readonly latestTurn: { readonly turnId: string } | null;
       readonly checkpoints: ReadonlyArray<{ readonly checkpointTurnCount: number }>;
-      readonly activities: ReadonlyArray<{ readonly kind: string }>;
+      readonly activities: ReadonlyArray<{ readonly kind: string; readonly payload: unknown }>;
+      readonly session?: { readonly status: string; readonly activeTurnId: string | null } | null;
     }>;
   }>,
   predicate: (thread: {
     latestTurn: { turnId: string } | null;
     checkpoints: ReadonlyArray<{ checkpointTurnCount: number }>;
-    activities: ReadonlyArray<{ kind: string }>;
+    activities: ReadonlyArray<{ kind: string; payload: unknown }>;
+    session?: { status: string; activeTurnId: string | null } | null;
   }) => boolean,
   timeoutMs = 15_000,
 ) {
@@ -175,7 +177,8 @@ async function waitForThread(
   const poll = async (): Promise<{
     latestTurn: { turnId: string } | null;
     checkpoints: ReadonlyArray<{ checkpointTurnCount: number }>;
-    activities: ReadonlyArray<{ kind: string }>;
+    activities: ReadonlyArray<{ kind: string; payload: unknown }>;
+    session?: { status: string; activeTurnId: string | null } | null;
   }> => {
     const snapshot = await readModel();
     const thread = snapshot.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
@@ -496,6 +499,237 @@ describe("CheckpointReactor", () => {
       pullRequestRefreshes,
     };
   }
+
+  effectIt.effect("blocks safe undo while an agent turn is active", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const createdAt = "2026-01-01T00:00:00.000Z";
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-safe-undo-active-session"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
+      yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (thread) => thread.session?.status === "ready"),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-safe-undo-active-diff-1"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("turn-before-active"),
+        completedAt: createdAt,
+        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+        status: "ready",
+        files: [],
+        checkpointTurnCount: 1,
+        createdAt,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-safe-undo-active-diff"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("turn-active"),
+        completedAt: createdAt,
+        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+        status: "ready",
+        files: [],
+        checkpointTurnCount: 2,
+        createdAt,
+      });
+      yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (thread) =>
+          thread.checkpoints.some((checkpoint) => checkpoint.checkpointTurnCount === 2),
+        ),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-safe-undo-agent-started"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-active"),
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
+      yield* Effect.promise(() =>
+        waitForThread(
+          harness.readModel,
+          (thread) => thread.session?.activeTurnId === "turn-active",
+        ),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.make("cmd-safe-undo-active"),
+        threadId: ThreadId.make("thread-1"),
+        turnCount: 2,
+        scope: "provenance-turn",
+        createdAt,
+      });
+      const thread = yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (entry) =>
+          entry.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+        ),
+      );
+      expect(thread?.activities).toContainEqual(
+        expect.objectContaining({
+          kind: "checkpoint.revert.failed",
+          payload: expect.objectContaining({ detail: expect.stringContaining("agent turn") }),
+        }),
+      );
+      expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
+    }),
+  );
+
+  effectIt.effect("captures workspace and index recovery refs before safe undo", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const threadId = ThreadId.make("thread-1");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      NodeFS.writeFileSync(NodePath.join(harness.cwd, "staged.txt"), "staged\n", "utf8");
+      NodeFS.writeFileSync(NodePath.join(harness.cwd, "untracked.txt"), "untracked\n", "utf8");
+      runGit(harness.cwd, ["add", "staged.txt"]);
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-safe-undo-diff-1"),
+        threadId,
+        turnId: asTurnId("turn-1"),
+        completedAt: createdAt,
+        checkpointRef: checkpointRefForThreadTurn(threadId, 1),
+        status: "ready",
+        files: [],
+        checkpointTurnCount: 1,
+        createdAt,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-safe-undo-diff-2"),
+        threadId,
+        turnId: asTurnId("turn-2"),
+        completedAt: createdAt,
+        checkpointRef: checkpointRefForThreadTurn(threadId, 2),
+        status: "ready",
+        files: [],
+        checkpointTurnCount: 2,
+        createdAt,
+      });
+      yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (thread) =>
+          thread.checkpoints.some((checkpoint) => checkpoint.checkpointTurnCount === 2),
+        ),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.make("cmd-safe-undo-with-recovery"),
+        threadId,
+        turnCount: 2,
+        scope: "provenance-turn",
+        createdAt,
+      });
+      const thread = yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (entry) =>
+          entry.activities.some(
+            (activity) =>
+              activity.kind === "provenance.turn.reverted" ||
+              activity.kind === "checkpoint.revert.failed",
+          ),
+        ),
+      );
+      expect(thread.activities).not.toContainEqual(
+        expect.objectContaining({ kind: "checkpoint.revert.failed" }),
+      );
+      const reverted = thread?.activities.find(
+        (activity) => activity.kind === "provenance.turn.reverted",
+      );
+      const receipt = (
+        reverted?.payload as {
+          readonly undoReceipt?: {
+            readonly recoveryWorkspaceRef?: string;
+            readonly recoveryIndexRef?: string;
+          };
+        }
+      ).undoReceipt;
+      expect(receipt?.recoveryWorkspaceRef).toBeTruthy();
+      expect(receipt?.recoveryIndexRef).toBeTruthy();
+      expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+      expect(runGit(harness.cwd, ["show", `${receipt?.recoveryWorkspaceRef}:README.md`])).toBe(
+        "v3\n",
+      );
+      expect(runGit(harness.cwd, ["show", `${receipt?.recoveryWorkspaceRef}:untracked.txt`])).toBe(
+        "untracked\n",
+      );
+      expect(runGit(harness.cwd, ["show", `${receipt?.recoveryIndexRef}:staged.txt`])).toBe(
+        "staged\n",
+      );
+      expect(
+        runGit(harness.cwd, [
+          "ls-tree",
+          "--name-only",
+          `${receipt?.recoveryIndexRef}^{tree}`,
+          "--",
+          "untracked.txt",
+        ]),
+      ).toBe("");
+
+      NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "after undo\n", "utf8");
+      NodeFS.writeFileSync(NodePath.join(harness.cwd, "staged.txt"), "after undo\n", "utf8");
+      NodeFS.rmSync(NodePath.join(harness.cwd, "untracked.txt"));
+      NodeFS.writeFileSync(NodePath.join(harness.cwd, "extra.txt"), "extra\n", "utf8");
+      yield* harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.make("cmd-restore-pre-safe-undo-state"),
+        threadId,
+        turnCount: 2,
+        scope: "provenance-recovery",
+        createdAt,
+      });
+      const recoveredThread = yield* Effect.promise(() =>
+        waitForThread(harness.readModel, (entry) =>
+          entry.activities.some((activity) => activity.kind === "provenance.turn.recovered"),
+        ),
+      );
+
+      expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
+      expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "staged.txt"), "utf8")).toBe(
+        "staged\n",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "untracked.txt"), "utf8")).toBe(
+        "untracked\n",
+      );
+      expect(NodeFS.existsSync(NodePath.join(harness.cwd, "extra.txt"))).toBe(false);
+      expect(runGit(harness.cwd, ["diff", "--cached", "--name-only"])).toBe("staged.txt\n");
+      expect(runGit(harness.cwd, ["diff", "--name-only"])).toBe("README.md\n");
+      expect(runGit(harness.cwd, ["ls-files", "--others", "--exclude-standard"])).toBe(
+        "untracked.txt\n",
+      );
+      const recovered = recoveredThread.activities.find(
+        (activity) => activity.kind === "provenance.turn.recovered",
+      )?.payload as
+        | { readonly rollbackWorkspaceRef?: string; readonly rollbackIndexRef?: string }
+        | undefined;
+      yield* Effect.promise(harness.drain);
+      expect(gitRefExists(harness.cwd, receipt?.recoveryWorkspaceRef ?? "missing")).toBe(false);
+      expect(gitRefExists(harness.cwd, receipt?.recoveryIndexRef ?? "missing")).toBe(false);
+      expect(gitRefExists(harness.cwd, recovered?.rollbackWorkspaceRef ?? "missing")).toBe(false);
+      expect(gitRefExists(harness.cwd, recovered?.rollbackIndexRef ?? "missing")).toBe(false);
+    }),
+  );
 
   effectIt.effect("captures baseline and large turn summaries before completion receipts", () =>
     Effect.gen(function* () {

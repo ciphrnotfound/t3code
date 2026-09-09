@@ -6108,13 +6108,13 @@ export default function ChatView(props: ChatViewProps) {
   const onRevertToTurnCount = useCallback(
     async (
       turnCount: number,
-      scope: "thread" | "provenance-turn" = "thread",
+      scope: "thread" | "provenance-turn" | "provenance-recovery" = "thread",
       preview = false,
     ): Promise<boolean> => {
       const localApi = readLocalApi();
       if (!localApi || !activeThread || isRevertingCheckpoint) return false;
 
-      if (!supportsConversationRollback) {
+      if (scope === "thread" && !supportsConversationRollback) {
         setThreadError(
           activeThread.id,
           "This provider does not support reverting conversation history. Start a new thread instead.",
@@ -6133,6 +6133,7 @@ export default function ChatView(props: ChatViewProps) {
         return false;
       }
       const isProvenanceUndo = scope === "provenance-turn";
+      const isProvenanceRecovery = scope === "provenance-recovery";
       const confirmed = preview
         ? true
         : await localApi.dialogs.confirm(
@@ -6142,11 +6143,17 @@ export default function ChatView(props: ChatViewProps) {
                   "Conversation history and later non-overlapping workspace changes will be preserved.",
                   "The undo stops if the recorded patch no longer applies cleanly.",
                 ].join("\n")
-              : [
-                  `Revert this thread to checkpoint ${turnCount}?`,
-                  "This will discard newer messages and turn diffs in this thread.",
-                  "This action cannot be undone.",
-                ].join("\n"),
+              : isProvenanceRecovery
+                ? [
+                    `Restore the workspace state from before undoing turn ${turnCount}?`,
+                    "T3 will restore the recorded staged, unstaged, and untracked state.",
+                    "A rollback snapshot is created before recovery starts.",
+                  ].join("\n")
+                : [
+                    `Revert this thread to checkpoint ${turnCount}?`,
+                    "This will discard newer messages and turn diffs in this thread.",
+                    "This action cannot be undone.",
+                  ].join("\n"),
             { variant: "destructive" },
           );
       if (!confirmed) {
@@ -6160,7 +6167,7 @@ export default function ChatView(props: ChatViewProps) {
         input: {
           threadId: activeThread.id,
           turnCount,
-          ...(scope === "provenance-turn" ? { scope } : {}),
+          ...(scope !== "thread" ? { scope } : {}),
           ...(preview ? { preview: true } : {}),
         },
       });
@@ -6172,7 +6179,9 @@ export default function ChatView(props: ChatViewProps) {
             ? error.message
             : isProvenanceUndo
               ? "Failed to undo workspace changes."
-              : "Failed to revert thread state.",
+              : isProvenanceRecovery
+                ? "Failed to restore the pre-undo workspace state."
+                : "Failed to revert thread state.",
         );
       }
       setIsRevertingCheckpoint(false);
@@ -7831,6 +7840,7 @@ export default function ChatView(props: ChatViewProps) {
         onPreviewUndo={(turnCount) => onRevertToTurnCount(turnCount, "provenance-turn", true)}
         onAlertsHiddenChange={setProvenanceAlertsHidden}
         onUndoTurn={(turnCount) => onRevertToTurnCount(turnCount, "provenance-turn")}
+        onRestoreTurn={(turnCount) => onRevertToTurnCount(turnCount, "provenance-recovery")}
       />
     ) : renderedRightPanelSurface?.kind === "integration" && activeThread ? (
       <SafeIntegrationPanel

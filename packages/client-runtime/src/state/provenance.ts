@@ -35,6 +35,8 @@ export type ProvenanceUndoReceipt = {
   readonly appliedAt: string;
   readonly patchSha256: string;
   readonly paths: ReadonlyArray<string>;
+  readonly recoveryWorkspaceRef?: CheckpointRef;
+  readonly recoveryIndexRef?: CheckpointRef;
 };
 
 export type ProvenanceTurnChangeSet = {
@@ -381,6 +383,12 @@ function parseUndoReceipt(value: unknown): ProvenanceUndoReceipt | undefined {
     appliedAt: value.appliedAt,
     patchSha256: value.patchSha256,
     paths: value.paths,
+    ...(typeof value.recoveryWorkspaceRef === "string"
+      ? { recoveryWorkspaceRef: value.recoveryWorkspaceRef as CheckpointRef }
+      : {}),
+    ...(typeof value.recoveryIndexRef === "string"
+      ? { recoveryIndexRef: value.recoveryIndexRef as CheckpointRef }
+      : {}),
   };
 }
 
@@ -427,8 +435,10 @@ export function readProvenanceTurnChangeSets(
   }
   const undoReceiptByTurnId = new Map<TurnId, ProvenanceUndoReceipt | undefined>();
   for (const activity of activities) {
-    if (activity.kind !== "provenance.turn.reverted" || !isRecord(activity.payload)) continue;
-    if (typeof activity.payload.turnId === "string") {
+    if (!isRecord(activity.payload) || typeof activity.payload.turnId !== "string") continue;
+    if (activity.kind === "provenance.turn.recovered") {
+      undoReceiptByTurnId.delete(activity.payload.turnId as TurnId);
+    } else if (activity.kind === "provenance.turn.reverted") {
       undoReceiptByTurnId.set(
         activity.payload.turnId as TurnId,
         parseUndoReceipt(activity.payload.undoReceipt),

@@ -1,6 +1,6 @@
 import {
   CommandId,
-  type CheckpointRef,
+  CheckpointRef,
   EventId,
   MessageId,
   type ProjectId,
@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -33,6 +34,7 @@ import {
 import {
   checkpointRefForThreadTurn,
   resolveThreadWorkspaceCwd,
+  safeUndoRecoveryRefs,
 } from "../../checkpointing/Utils.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
@@ -50,9 +52,17 @@ import { findFileOverlaps, type ProvenanceMutation } from "../../provenance/File
 import { readPersistedProvenanceHistory } from "../../provenance/PersistedHistory.ts";
 import { summarizeProvenanceTurn } from "../../provenance/TurnSummary.ts";
 import { shouldAppendRevertFailure } from "../../provenance/FailureDedup.ts";
-import { isProvenanceEnabled, worktreeMismatch } from "../../provenance/config.ts";
+import {
+  isProvenanceEnabled,
+  workspacePathsEqual,
+  worktreeMismatch,
+} from "../../provenance/config.ts";
 import { undoApplyArgs, undoDiffArgs } from "../../provenance/UndoPatch.ts";
 import { VcsDriverRegistry } from "../../vcs/VcsDriverRegistry.ts";
+
+class SafeUndoRecoverySnapshotError extends Data.TaggedError("SafeUndoRecoverySnapshotError")<{
+  readonly detail: string;
+}> {}
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -119,6 +129,84 @@ const make = Effect.gen(function* () {
   const receiptBus = yield* RuntimeReceiptBus;
   const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
   const vcsDriverRegistry = yield* VcsDriverRegistry;
+
+  const captureExactWorkspaceState = Effect.fn("captureExactWorkspaceState")(function* (input: {
+    readonly cwd: string;
+    readonly workspaceRef: CheckpointRef;
+    readonly indexRef: CheckpointRef;
+  }) {
+    const vcsDriver = yield* vcsDriverRegistry.get("git");
+    yield* checkpointStore.captureCheckpoint({
+      cwd: input.cwd,
+      checkpointRef: input.workspaceRef,
+    });
+    const indexTree = yield* vcsDriver.execute({
+      operation: "provenance.safeUndo.captureIndex",
+      cwd: input.cwd,
+      args: ["write-tree"],
+    });
+    const indexTreeOid = indexTree.stdout.trim();
+    if (indexTreeOid.length === 0) {
+      return yield* new SafeUndoRecoverySnapshotError({
+        detail: "git write-tree returned an empty tree oid for the recovery snapshot.",
+      });
+    }
+    yield* vcsDriver.execute({
+      operation: "provenance.safeUndo.storeIndex",
+      cwd: input.cwd,
+      args: ["update-ref", input.indexRef, indexTreeOid],
+    });
+  });
+
+  const restoreExactWorkspaceState = Effect.fn("restoreExactWorkspaceState")(function* (input: {
+    readonly cwd: string;
+    readonly workspaceRef: CheckpointRef;
+    readonly indexRef: CheckpointRef;
+  }) {
+    const vcsDriver = yield* vcsDriverRegistry.get("git");
+    const [workspaceRef, indexRef] = yield* Effect.all([
+      vcsDriver.execute({
+        operation: "provenance.safeUndo.verifyWorkspaceRecovery",
+        cwd: input.cwd,
+        args: ["rev-parse", "--verify", "--quiet", `${input.workspaceRef}^{commit}`],
+        allowNonZeroExit: true,
+      }),
+      vcsDriver.execute({
+        operation: "provenance.safeUndo.verifyIndexRecovery",
+        cwd: input.cwd,
+        args: ["rev-parse", "--verify", "--quiet", `${input.indexRef}^{tree}`],
+        allowNonZeroExit: true,
+      }),
+    ]);
+    if (workspaceRef.exitCode !== 0 || indexRef.exitCode !== 0) {
+      return yield* new SafeUndoRecoverySnapshotError({
+        detail: "One or more recovery refs are unavailable.",
+      });
+    }
+    yield* vcsDriver.execute({
+      operation: "provenance.safeUndo.restoreWorkspace",
+      cwd: input.cwd,
+      args: [
+        "restore",
+        "--source",
+        `${input.workspaceRef}^{commit}`,
+        "--worktree",
+        "--staged",
+        "--",
+        ".",
+      ],
+    });
+    yield* vcsDriver.execute({
+      operation: "provenance.safeUndo.cleanWorkspace",
+      cwd: input.cwd,
+      args: ["clean", "-fd", "--", "."],
+    });
+    yield* vcsDriver.execute({
+      operation: "provenance.safeUndo.restoreIndex",
+      cwd: input.cwd,
+      args: ["read-tree", `${input.indexRef}^{tree}`],
+    });
+  });
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const startedTurns = new Map<ThreadId, TurnId>();
@@ -230,6 +318,16 @@ const make = Effect.gen(function* () {
       .getProjectShellById(projectId)
       .pipe(Effect.map(Option.getOrUndefined));
     return project ? [project] : [];
+  });
+
+  const hasActiveWorkspaceWriter = Effect.fn("hasActiveWorkspaceWriter")(function* (cwd: string) {
+    const sessions = yield* providerService.listSessions();
+    return sessions.some(
+      (session) =>
+        session.activeTurnId !== null &&
+        session.activeTurnId !== undefined &&
+        workspacePathsEqual(session.cwd, cwd),
+    );
   });
 
   const ensureProvenanceHistory = Effect.fn("ensureProvenanceHistory")(function* (
@@ -375,14 +473,6 @@ const make = Effect.gen(function* () {
             unsupportedPaths,
           };
         }),
-        Effect.tapError((error) =>
-          appendCaptureFailureActivity({
-            threadId: input.threadId,
-            turnId: input.turnId,
-            detail: `Checkpoint captured, but turn diff summary is unavailable: ${error.message}`,
-            createdAt: input.createdAt,
-          }),
-        ),
         Effect.catch((error) =>
           Effect.logWarning("failed to derive checkpoint file summary", {
             threadId: input.threadId,
@@ -1006,12 +1096,208 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    if (event.payload.scope === "provenance-turn") {
-      const alreadyReverted = thread.activities.some((activity) => {
-        if (activity.kind !== "provenance.turn.reverted") return false;
+    if (event.payload.scope === "provenance-recovery") {
+      if (
+        thread.session?.status === "starting" ||
+        thread.session?.status === "running" ||
+        (thread.session?.activeTurnId !== null && thread.session?.activeTurnId !== undefined) ||
+        (yield* hasActiveWorkspaceWriter(checkpointCwd))
+      ) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Recovery is unavailable while an agent turn is writing to this workspace. Stop or finish the turn, then try again.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      const latestRecoveryActivity = thread.activities.toReversed().find((activity) => {
+        if (
+          activity.kind !== "provenance.turn.reverted" &&
+          activity.kind !== "provenance.turn.recovered"
+        ) {
+          return false;
+        }
         const payload = activity.payload as { readonly turnCount?: unknown };
         return payload.turnCount === event.payload.turnCount;
       });
+      const revertedActivity =
+        latestRecoveryActivity?.kind === "provenance.turn.reverted"
+          ? latestRecoveryActivity
+          : undefined;
+      const revertedPayload = revertedActivity?.payload as
+        | {
+            readonly turnId?: unknown;
+            readonly undoReceipt?: {
+              readonly recoveryWorkspaceRef?: unknown;
+              readonly recoveryIndexRef?: unknown;
+            };
+          }
+        | undefined;
+      const recoveryWorkspaceRef = revertedPayload?.undoReceipt?.recoveryWorkspaceRef;
+      const recoveryIndexRef = revertedPayload?.undoReceipt?.recoveryIndexRef;
+      if (typeof recoveryWorkspaceRef !== "string" || typeof recoveryIndexRef !== "string") {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: "This undo does not have a complete recovery snapshot.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+
+      const rollbackRefs = safeUndoRecoveryRefs({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        eventId: event.eventId,
+      });
+      const rollbackCaptured = yield* captureExactWorkspaceState({
+        cwd: checkpointCwd,
+        workspaceRef: rollbackRefs.workspace,
+        indexRef: rollbackRefs.index,
+      }).pipe(
+        Effect.tapError(() =>
+          checkpointStore
+            .deleteCheckpointRefs({
+              cwd: checkpointCwd,
+              checkpointRefs: [rollbackRefs.workspace, rollbackRefs.index],
+            })
+            .pipe(Effect.ignore),
+        ),
+        Effect.matchEffect({
+          onFailure: (error) =>
+            appendRevertFailureActivity({
+              threadId: event.payload.threadId,
+              turnCount: event.payload.turnCount,
+              detail: `Recovery stopped before changing files because a rollback snapshot could not be created: ${String(error)}`,
+              createdAt: now,
+            }).pipe(
+              Effect.catch(() => Effect.void),
+              Effect.as(false),
+            ),
+          onSuccess: () => Effect.succeed(true),
+        }),
+      );
+      if (!rollbackCaptured) return;
+
+      const restored = yield* restoreExactWorkspaceState({
+        cwd: checkpointCwd,
+        workspaceRef: CheckpointRef.make(recoveryWorkspaceRef),
+        indexRef: CheckpointRef.make(recoveryIndexRef),
+      }).pipe(
+        Effect.matchEffect({
+          onFailure: (error) =>
+            restoreExactWorkspaceState({
+              cwd: checkpointCwd,
+              workspaceRef: rollbackRefs.workspace,
+              indexRef: rollbackRefs.index,
+            }).pipe(
+              Effect.matchEffect({
+                onFailure: (rollbackError) =>
+                  appendRevertFailureActivity({
+                    threadId: event.payload.threadId,
+                    turnCount: event.payload.turnCount,
+                    detail: `Recovery failed and its automatic rollback also failed. Inspect the workspace before continuing. Recovery: ${String(error)} Rollback: ${String(rollbackError)}`,
+                    createdAt: now,
+                  }).pipe(
+                    Effect.catch(() => Effect.void),
+                    Effect.as(false),
+                  ),
+                onSuccess: () =>
+                  checkpointStore
+                    .deleteCheckpointRefs({
+                      cwd: checkpointCwd,
+                      checkpointRefs: [rollbackRefs.workspace, rollbackRefs.index],
+                    })
+                    .pipe(
+                      Effect.ignore,
+                      Effect.andThen(
+                        appendRevertFailureActivity({
+                          threadId: event.payload.threadId,
+                          turnCount: event.payload.turnCount,
+                          detail: `Recovery could not be applied, so T3 restored the post-undo workspace unchanged: ${String(error)}`,
+                          createdAt: now,
+                        }).pipe(Effect.catch(() => Effect.void)),
+                      ),
+                      Effect.as(false),
+                    ),
+              }),
+            ),
+          onSuccess: () => Effect.succeed(true),
+        }),
+      );
+      if (!restored) return;
+
+      yield* workspaceEntries.refresh(checkpointCwd);
+      yield* vcsStatusBroadcaster
+        .refreshLocalStatus(checkpointCwd)
+        .pipe(Effect.catch(() => Effect.succeed(null)));
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provenance-turn-recovered"),
+        threadId: event.payload.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "info",
+          kind: "provenance.turn.recovered",
+          summary: "Undo recovery applied",
+          payload: {
+            origin: "t3-provenance",
+            turnId: typeof revertedPayload?.turnId === "string" ? revertedPayload.turnId : null,
+            turnCount: event.payload.turnCount,
+            restoredWorkspaceRef: recoveryWorkspaceRef,
+            restoredIndexRef: recoveryIndexRef,
+            rollbackWorkspaceRef: rollbackRefs.workspace,
+            rollbackIndexRef: rollbackRefs.index,
+            recoveredAt: now,
+          },
+          turnId: null,
+          createdAt: now,
+        },
+        createdAt: now,
+      });
+      yield* checkpointStore
+        .deleteCheckpointRefs({
+          cwd: checkpointCwd,
+          checkpointRefs: [
+            CheckpointRef.make(recoveryWorkspaceRef),
+            CheckpointRef.make(recoveryIndexRef),
+            rollbackRefs.workspace,
+            rollbackRefs.index,
+          ],
+        })
+        .pipe(Effect.ignore);
+      return;
+    }
+
+    if (event.payload.scope === "provenance-turn") {
+      if (
+        thread.session?.status === "starting" ||
+        thread.session?.status === "running" ||
+        (thread.session?.activeTurnId !== null && thread.session?.activeTurnId !== undefined) ||
+        (yield* hasActiveWorkspaceWriter(checkpointCwd))
+      ) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Safe undo is unavailable while an agent turn is writing to this workspace. Stop or finish the turn, then try again.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      const latestRecoveryActivity = thread.activities.toReversed().find((activity) => {
+        if (
+          activity.kind !== "provenance.turn.reverted" &&
+          activity.kind !== "provenance.turn.recovered"
+        ) {
+          return false;
+        }
+        const payload = activity.payload as { readonly turnCount?: unknown };
+        return payload.turnCount === event.payload.turnCount;
+      });
+      const alreadyReverted = latestRecoveryActivity?.kind === "provenance.turn.reverted";
       if (alreadyReverted) return;
 
       if (event.payload.turnCount === 0) {
@@ -1110,6 +1396,46 @@ const make = Effect.gen(function* () {
         });
         return;
       }
+      const patchSha256 = NodeCrypto.createHash("sha256")
+        .update(reversePatch, "utf8")
+        .digest("hex");
+      const recoveryRefs = safeUndoRecoveryRefs({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        eventId: event.eventId,
+      });
+      // Preserve workspace contents and the real index independently so a
+      // recovery can reconstruct staged, unstaged, and untracked state.
+      const captureRecovery = captureExactWorkspaceState({
+        cwd: checkpointCwd,
+        workspaceRef: recoveryRefs.workspace,
+        indexRef: recoveryRefs.index,
+      }).pipe(
+        Effect.tapError(() =>
+          checkpointStore
+            .deleteCheckpointRefs({
+              cwd: checkpointCwd,
+              checkpointRefs: [recoveryRefs.workspace, recoveryRefs.index],
+            })
+            .pipe(Effect.ignore),
+        ),
+      );
+      const recoveryCaptured = yield* captureRecovery.pipe(
+        Effect.matchEffect({
+          onFailure: (error) =>
+            appendRevertFailureActivity({
+              threadId: event.payload.threadId,
+              turnCount: event.payload.turnCount,
+              detail: `Safe undo stopped before changing files because its recovery snapshot could not be created: ${String(error)}`,
+              createdAt: now,
+            }).pipe(
+              Effect.catch(() => Effect.void),
+              Effect.as(false),
+            ),
+          onSuccess: () => Effect.succeed(true),
+        }),
+      );
+      if (!recoveryCaptured) return;
       const applied = yield* vcsDriver.execute({
         operation: "provenance.safeUndo.apply",
         cwd: checkpointCwd,
@@ -1121,6 +1447,12 @@ const make = Effect.gen(function* () {
         allowNonZeroExit: true,
       });
       if (applied.exitCode !== 0) {
+        yield* checkpointStore
+          .deleteCheckpointRefs({
+            cwd: checkpointCwd,
+            checkpointRefs: [recoveryRefs.workspace, recoveryRefs.index],
+          })
+          .pipe(Effect.ignore);
         yield* appendRevertFailureActivity({
           threadId: event.payload.threadId,
           turnCount: event.payload.turnCount,
@@ -1166,10 +1498,10 @@ const make = Effect.gen(function* () {
               version: 1,
               scope: "code-only",
               appliedAt: now,
-              patchSha256: NodeCrypto.createHash("sha256")
-                .update(reversePatch, "utf8")
-                .digest("hex"),
+              patchSha256,
               paths: parseTurnDiffFilesFromUnifiedDiff(reversePatch).map((file) => file.path),
+              recoveryWorkspaceRef: recoveryRefs.workspace,
+              recoveryIndexRef: recoveryRefs.index,
             },
           },
           turnId: null,

@@ -1027,7 +1027,7 @@ const ThreadCheckpointRevertCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   turnCount: NonNegativeInt,
-  scope: Schema.optional(Schema.Literal("provenance-turn")),
+  scope: Schema.optional(Schema.Literals(["provenance-turn", "provenance-recovery"])),
   preview: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });
@@ -1455,7 +1455,7 @@ const ThreadUserInputResponseRequestedPayload = Schema.Struct({
 export const ThreadCheckpointRevertRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnCount: NonNegativeInt,
-  scope: Schema.optional(Schema.Literal("provenance-turn")),
+  scope: Schema.optional(Schema.Literals(["provenance-turn", "provenance-recovery"])),
   preview: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });

@@ -365,6 +365,51 @@ describe("readProvenanceTurnChangeSets", () => {
     expect(result[0]?.status).toBe("reverted");
     expect(result[0]?.undoReceipt).toBeUndefined();
   });
+
+  it("makes a turn undoable again after its pre-undo state is recovered", () => {
+    const result = readProvenanceTurnChangeSets([
+      {
+        id: "event-completed-recovered",
+        tone: "info",
+        kind: "provenance.turn.completed",
+        summary: "Agent turn change set recorded",
+        turnId: "turn-a",
+        createdAt: "2026-08-31T10:00:00.000Z",
+        payload: { mutations: [mutation()] },
+      } as never,
+      {
+        id: "event-reverted-recovered",
+        tone: "info",
+        kind: "provenance.turn.reverted",
+        summary: "Safe undo applied",
+        turnId: null,
+        createdAt: "2026-08-31T10:01:00.000Z",
+        payload: {
+          turnId: "turn-a",
+          turnCount: 1,
+          undoReceipt: {
+            version: 1,
+            scope: "code-only",
+            appliedAt: "2026-08-31T10:01:00.000Z",
+            patchSha256: "a".repeat(64),
+            paths: ["src/auth/session.ts"],
+          },
+        },
+      } as never,
+      {
+        id: "event-recovered",
+        tone: "info",
+        kind: "provenance.turn.recovered",
+        summary: "Undo recovery applied",
+        turnId: null,
+        createdAt: "2026-08-31T10:02:00.000Z",
+        payload: { turnId: "turn-a", turnCount: 1 },
+      } as never,
+    ]);
+
+    expect(result[0]?.status).toBe("completed");
+    expect(result[0]?.undoReceipt).toBeUndefined();
+  });
 });
 
 describe("buildSafeUndoPreview", () => {
