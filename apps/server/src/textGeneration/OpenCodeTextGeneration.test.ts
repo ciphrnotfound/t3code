@@ -27,6 +27,7 @@ const runtimeMock = {
     promptAsyncCalls: 0,
     messagesCalls: 0,
     emptyMessageResponses: 0,
+    alwaysEmptyMessages: false,
     connectionError: undefined as Error | undefined,
     sessionCreateError: undefined as unknown,
     sessionResult: undefined as { data?: { id: string } } | undefined,
@@ -45,6 +46,7 @@ const runtimeMock = {
     this.state.promptAsyncCalls = 0;
     this.state.messagesCalls = 0;
     this.state.emptyMessageResponses = 0;
+    this.state.alwaysEmptyMessages = false;
     this.state.connectionError = undefined;
     this.state.sessionCreateError = undefined;
     this.state.sessionResult = undefined;
@@ -121,6 +123,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
         },
         messages: async () => {
           runtimeMock.state.messagesCalls += 1;
+          if (runtimeMock.state.alwaysEmptyMessages) {
+            return { data: [] };
+          }
           if (runtimeMock.state.emptyMessageResponses > 0) {
             runtimeMock.state.emptyMessageResponses -= 1;
             return { data: [] };
@@ -336,6 +341,30 @@ it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGeneration", (it) => {
         expect(generated).toEqual({
           subject: "Improve OpenCode reuse",
           body: "Reuse one server for the full action.",
+        });
+      }),
+    ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("returns an empty-output error when no assistant message arrives", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.alwaysEmptyMessages = true;
+
+        const fiber = yield* textGeneration
+          .generateCommitMessage(DEFAULT_COMMIT_MESSAGE_INPUT)
+          .pipe(Effect.flip, Effect.fork);
+        yield* Effect.yieldNow;
+
+        yield* TestClock.adjust("30 seconds");
+        const error = yield* Fiber.join(fiber);
+
+        expect(error.message).toContain("OpenCode returned empty output.");
+        expect(error.cause).toMatchObject({
+          _tag: "OpenCodeTextGenerationEmptyOutputError",
+          operation: "generateCommitMessage",
+          responsePartCount: 0,
+          textPartCount: 0,
         });
       }),
     ).pipe(Effect.provide(TestClock.layer())),

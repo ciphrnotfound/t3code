@@ -38,6 +38,8 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
 
+const OPEN_CODE_TEXT_GENERATION_WAIT_TIMEOUT = "30 seconds";
+
 const openCodeTextGenerationErrorContext = {
   operation: OpenCodeTextGenerationOperation,
   cwd: Schema.String,
@@ -323,7 +325,18 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
 
             yield* Effect.sleep("50 millis");
           }
-        });
+        }).pipe(
+          Effect.timeout(OPEN_CODE_TEXT_GENERATION_WAIT_TIMEOUT),
+          Effect.catchTag("TimeoutError", () =>
+            Effect.fail(
+              new OpenCodeTextGenerationEmptyOutputError({
+                ...promptContext,
+                responsePartCount: 0,
+                textPartCount: 0,
+              }),
+            ),
+          ),
+        );
         const promptFailure = getOpenCodePromptFailure(result.info.error);
         if (promptFailure) {
           return yield* new OpenCodeTextGenerationPromptResponseError({
